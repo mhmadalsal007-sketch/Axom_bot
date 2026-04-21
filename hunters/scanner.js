@@ -1,8 +1,9 @@
-const B = require('../core/binance');
+const B = require('../core/bingx');
 const A = require('../brain/analyzer');
 const L = require('../brain/liquidity');
 const G = require('../core/gemini');
 const db = require('../core/database');
+const marketTracker = require('../core/marketTracker');
 
 const oiCache = {}, liqCache = {};
 
@@ -53,7 +54,7 @@ async function deepAnalyze({ sym, oi, oiChg, fund }, openTrades) {
       B.getKlines(sym, '1h', 30)
     ]);
 
-    const price = c1m[c1m.length-1].close;
+    const price = marketTracker.getPrice(sym) || c1m[c1m.length-1].close;
     const kz = A.getKillZone();
 
     // Step 1: HTF Bias
@@ -100,8 +101,10 @@ async function deepAnalyze({ sym, oi, oiChg, fund }, openTrades) {
     // Slippage hunt
     const slip = A.detectSlippageHunt(c1m, liqLvl.eqh, liqLvl.eql);
 
-    // LS Score
-    const ls = L.calcLS(oiChg, vol.ratio, liqCache[sym]||0, fund);
+    // LS Score — use marketTracker data
+    const trackedLiq = marketTracker.getLiquidations1h(sym);
+    const trackedVol = marketTracker.getVolumeRatio(sym);
+    const ls = L.calcLS(oiChg, trackedVol || vol.ratio, trackedLiq || liqCache[sym] || 0, fund);
     const lsScore = ls.score;
 
     // Long/Short ratio
@@ -169,8 +172,9 @@ async function deepAnalyze({ sym, oi, oiChg, fund }, openTrades) {
 
 function trackLiquidation(liq) {
   if (!liq?.symbol) return;
-  liqCache[liq.symbol] = (liqCache[liq.symbol]||0) + (liq.value||0);
-  setTimeout(() => { if (liqCache[liq.symbol]) liqCache[liq.symbol] = 0; }, 3600000);
+  liqCache[liq.symbol] = (liqCache[liq.symbol] || 0) + (liq.value || 0);
+  marketTracker.addLiquidation(liq.symbol, liq.value || 0);
+  setTimeout(() => { liqCache[liq.symbol] = 0; }, 3600000);
 }
 
 module.exports = { scan, deepAnalyze, trackLiquidation };
