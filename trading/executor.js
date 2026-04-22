@@ -1,62 +1,173 @@
-const B = require('../core/binance');
-const db = require('../core/database');
-const tg = require('../core/telegram');
+// ============================================================
+// AXOM — Risk Engine + Trade Executor
+// Handles position sizing, TP/SL management, compounding
+// ============================================================
+const bingx    = require('../core/bingx');
+const db       = require('../core/database');
+const dash     = require('../core/dashboard');
+const MT       = require('../core/marketTracker');
+const logger   = require('../utils/logger');
 
-// ─── OPEN TRADE ───────────────────────────────────────────────
-async function openTrade(signal, session, riskMgr) {
-  const mode = process.env.BOT_MODE || 'PAPER';
-  const risk = riskMgr.risk(session.start_capital);
-  const pos = B.calcPositionSize(risk, signal.entry_price, signal.stop_loss, signal.leverage);
-  if (!pos) throw new Error('Invalid position size calc');
+const TRAIL_PCT = 0.003; // 0.3% trailing stop
 
-  const fees = B.calcFees(pos.positionSize, signal.entry_price, signal.entry_price);
+// ─── LEVERAGE TABLE ──────────────────────────────────────────
+function getLeverage(score, atr, kz, streak, ls) {
+  if (score < 60) return 0;
+  let lev = score>=90?45 : score>=85?35 : score>=75?25 : 15;
+  if (kz?.active)    lev += 5;
+  if (atr  < 0.3)    lev += 10;
+  else if (atr<0.6)  lev += 0;
+  else if (atr<1.0)  lev -= 5;
+  else if (atr<1.5)  lev -= 10;
+  else               lev -= 15;
+  if (streak >= 3)   lev += 5;
+  if (ls >= 80)      lev += 5;
+  return Math.max(10, Math.min(50, Math.round(lev)));
+}
 
-  // Set leverage
-  if (mode === 'REAL') await B.setLeverage(signal.symbol, signal.leverage);
+// ─── TP LEVELS ───────────────────────────────────────────────
+function getTPLevels(entry, sl, dir) {
+  const d  = Math.abs(entry - sl);
+  const s  = dir === 'LONG' ? 1 : -1;
+  return {
+    tp1: parseFloat((entry + s*d*1.0).toFixed(4)),
+    tp2: parseFloat((entry + s*d*2.0).toFixed(4)),
+    tp3: parseFloat((entry + s*d*3.0).toFixed(4)),
+    rr:  '1:3', slDist: d
+  };
+}
 
-  // Entry order
-  const side = signal.direction === 'LONG' ? 'BUY' : 'SELL';
-  const order = await B.placeOrder({ symbol: signal.symbol, side, type: 'MARKET', quantity: pos.positionSize });
-
-  // SL order (always placed on exchange for safety)
-  let slOrderId = null;
-  if (mode === 'REAL' && order.status === 'FILLED') {
-    const slSide = side === 'BUY' ? 'SELL' : 'BUY';
-    const slOrder = await B.placeOrder({ symbol: signal.symbol, side: slSide, type: 'STOP_MARKET', quantity: pos.positionSize, stopPrice: signal.stop_loss, reduceOnly: true });
-    slOrderId = slOrder.orderId;
+// ─── COMPOUNDING STATE ────────────────────────────────────────
+class CompoundState {
+  constructor(baseRisk, stopAmt) {
+    this.baseRisk          = baseRisk;
+    this.stopAmount        = stopAmt;
+    this.balance           = baseRisk;
+    this.high              = baseRisk;
+    this.locked            = 0;
+    this.consecutiveWins   = 0;
+    this.consecutiveLosses = 0;
+    this.ladderMultiplier  = 1.0;
+    this.trades            = 0;
+    this.wins              = 0;
   }
 
-  const trade = await db.saveTrade({
-    session_id: session.id,
-    symbol: signal.symbol,
-    mode,
-    direction: signal.direction,
-    wave_type: signal.wave_type || 'RIDER',
-    entry_price: signal.entry_price,
-    current_price: signal.entry_price,
-    stop_loss: signal.stop_loss,
-    original_sl: signal.stop_loss,
-    tp1: signal.tp1,
-    tp2: signal.tp2,
-    tp3: signal.tp3 || (signal.tp2 + Math.abs(signal.tp2 - signal.tp1)),
-    leverage: signal.leverage,
-    risk_amount: risk,
-    position_size: pos.positionSize,
-    position_value: pos.positionValue,
-    margin_used: pos.margin,
-    fee_open: fees.feeOpen,
-    total_fees: fees.feeOpen,
-    status: 'OPEN',
-    score: signal.score,
-    smt_detected: signal.smt_detected || false,
-    slippage_hunt: signal.slippage_hunt || false,
-    kill_zone: signal.kill_zone?.zone || 'OFF',
-    binance_order_id: order.orderId,
-    sl_order_id: slOrderId
+  update(pnl) {
+    this.balance += pnl;
+    this.trades++;
+    if (pnl > 0) {
+      this.wins++; this.consecutiveWins++; this.consecutiveLosses = 0;
+      if (this.consecutiveWins>=6)      this.ladderMultiplier = 1.8;
+      else if (this.consecutiveWins>=4) this.ladderMultiplier = 1.5;
+      else if (this.consecutiveWins>=2) this.ladderMultiplier = 1.2;
+    } else {
+      this.consecutiveLosses++; this.consecutiveWins = 0;
+      this.ladderMultiplier = 1.0;
+    }
+    this.ladderMultiplier = Math.min(2.0, this.ladderMultiplier);
+    if (this.balance > this.high) this.high = this.balance;
+    this._updateLock();
+  }
+
+  _updateLock() {
+    const p = this.balance - this.baseRisk;
+    this.locked = p>=50?this.baseRisk+40 : p>=30?this.baseRisk+25 : p>=20?this.baseRisk+15 : p>=10?this.baseRisk+7 : p>=5?this.baseRisk+3 : 0;
+  }
+
+  currentRisk() { return parseFloat((this.baseRisk * this.ladderMultiplier).toFixed(4)); }
+  leverageBonus() { return this.consecutiveWins>=3 ? 5 : 0; }
+  winRate() { return this.trades>0?((this.wins/this.trades)*100).toFixed(1):0; }
+
+  shouldStop() {
+    const lost = this.baseRisk - this.balance;
+    if (lost >= this.stopAmount) return { stop:true, reason:'DAILY_STOP' };
+    if (this.locked>0 && this.balance<this.locked) return { stop:true, reason:'PROFIT_LOCK' };
+    if (this.balance<this.high*0.5 && this.balance>this.baseRisk*0.5) return { stop:true, reason:'PROFIT_PROTECT', ask:true };
+    return { stop:false };
+  }
+
+  shouldPause() {
+    if (this.consecutiveLosses>=3) return { pause:true, reason:'3 خسارات متتالية', mins:60 };
+    return { pause:false };
+  }
+}
+
+// ─── OPEN TRADE ───────────────────────────────────────────────
+async function openTrade(signal, session, compound) {
+  const mode    = process.env.BOT_MODE || 'PAPER';
+  const risk    = compound ? compound.currentRisk() : session.start_capital;
+  const lev     = signal.leverage + (compound?.leverageBonus()||0);
+  const leverage = Math.min(50, lev);
+
+  // Get entry price from live feed
+  const livePrice = MT.getPrice(signal.symbol) || signal.entry;
+  const entry = livePrice || signal.entry;
+  const sl    = signal.sl;
+
+  if (!entry || !sl) throw new Error('Invalid entry/SL prices');
+
+  // Check balance
+  try {
+    const balInfo = await bingx.getBalance();
+    const needed  = risk / (Math.abs(entry-sl)/entry); // approx margin
+    if (balInfo.available < needed * 0.5) {
+      logger.warn('EXECUTOR', `Low balance: $${balInfo.available} for risk $${risk}`);
+      await dash.sendBalanceAlert(balInfo.available, mode);
+    }
+  } catch (e) {
+    logger.error('EXECUTOR', `Balance check failed: ${e.message}`);
+  }
+
+  // Position size
+  const pos = bingx.calcPositionSize(risk, entry, sl, leverage);
+  if (!pos) throw new Error('Position size calc failed');
+
+  const tpLevels = getTPLevels(entry, sl, signal.direction);
+  const fees     = bingx.calcFees(pos.positionSize, entry, entry);
+
+  // Execute order
+  const side  = signal.direction === 'LONG' ? 'BUY' : 'SELL';
+  const order = await bingx.placeOrder({
+    symbol: signal.symbol, side, type:'MARKET',
+    quantity: pos.positionSize, price: entry,
+    leverage, stopLoss: sl, takeProfit: tpLevels.tp2
   });
 
-  await tg.sendTradeOpen(trade);
-  await db.saveLog('INFO','TRADE',`Opened ${signal.direction} ${signal.symbol} x${signal.leverage} @ ${signal.entry_price}`, { tradeId: trade.id, score: signal.score });
+  if (!order.success && order.error) {
+    throw new Error(`Order failed: ${order.error}`);
+  }
+
+  // Save to DB
+  const trade = await db.saveTrade({
+    session_id:    session.id,
+    symbol:        signal.symbol,
+    mode,
+    direction:     signal.direction,
+    wave_type:     signal.wave_type || 'RIDER',
+    entry_price:   entry,
+    current_price: entry,
+    stop_loss:     sl,
+    original_sl:   sl,
+    tp1:           tpLevels.tp1,
+    tp2:           tpLevels.tp2,
+    tp3:           tpLevels.tp3,
+    leverage,
+    risk_amount:   risk,
+    position_size: pos.positionSize,
+    position_value:pos.positionValue,
+    margin_used:   pos.margin,
+    fee_open:      fees.feeOpen,
+    total_fees:    fees.feeOpen,
+    status:        'OPEN',
+    score:         signal.score,
+    kill_zone:     signal.kz?.zone || 'OFF',
+    smt_detected:  signal.smt || false,
+    slippage_hunt: signal.slippage || false,
+    bingx_order_id: order.orderId || null
+  });
+
+  await dash.sendTradeOpen(trade);
+  logger.info('EXECUTOR', `Opened ${signal.direction} ${signal.symbol} x${leverage} @ ${entry} risk:$${risk}`);
   return trade;
 }
 
@@ -64,9 +175,8 @@ async function openTrade(signal, session, riskMgr) {
 async function monitorAll(prices) {
   const open = await db.getOpenTrades();
   for (const t of open) {
-    const price = prices[t.symbol];
+    const price = prices[t.symbol] || MT.getPrice(t.symbol);
     if (!price) continue;
-    // Update current price
     await db.updateTrade(t.id, { current_price: price });
     await checkTPSL(t, price);
   }
@@ -75,22 +185,26 @@ async function monitorAll(prices) {
 async function checkTPSL(t, price) {
   const long = t.direction === 'LONG';
 
-  // SL check (only if no TP1 yet)
+  // SL hit (no TP yet)
   if (!t.tp1_hit) {
     const slHit = long ? price <= t.stop_loss : price >= t.stop_loss;
-    if (slHit) { await closeTrade(t, price, 'SL_HIT', 1.0); return; }
+    if (slHit) { await closeTrade(t, price, 'SL_HIT'); return; }
   }
 
-  // SL after TP1 (Breakeven)
+  // Breakeven (after TP1)
   if (t.tp1_hit && !t.tp2_hit) {
-    const slHit = long ? price <= t.entry_price : price >= t.entry_price;
-    if (slHit) { await closeTrade(t, t.entry_price, 'BREAKEVEN', 0.67); return; }
+    const beHit = long ? price <= t.entry_price : price >= t.entry_price;
+    if (beHit) { await closeTrade(t, t.entry_price, 'BREAKEVEN', 0.67); return; }
   }
 
-  // SL after TP2 (at TP1)
+  // After TP2 — trailing
   if (t.tp2_hit) {
-    const slHit = long ? price <= t.stop_loss : price >= t.stop_loss;
-    if (slHit) { await closeTrade(t, t.stop_loss, 'TRAILING_STOP', 0.34); return; }
+    const trailHit = long ? price <= t.stop_loss : price >= t.stop_loss;
+    if (trailHit) { await closeTrade(t, t.stop_loss, 'TRAILING_STOP', 0.34); return; }
+    // Update trailing SL
+    const newSL = long ? price*(1-TRAIL_PCT) : price*(1+TRAIL_PCT);
+    const better = long ? newSL>t.stop_loss : newSL<t.stop_loss;
+    if (better) await db.updateTrade(t.id, { stop_loss:parseFloat(newSL.toFixed(4)) });
   }
 
   // TP1
@@ -104,89 +218,72 @@ async function checkTPSL(t, price) {
     const tp2Hit = long ? price >= t.tp2 : price <= t.tp2;
     if (tp2Hit) { await hitTP(t, price, 2); return; }
   }
-
-  // Trailing TP3
-  if (t.tp2_hit) await updateTrailing(t, price);
 }
 
-async function hitTP(t, price, tpNum) {
-  const pct = tpNum === 1 ? 0.33 : 0.33;
-  const partSize = t.position_size * pct;
-  const isLong = t.direction === 'LONG';
-  const pnl = isLong ? (price - t.entry_price) * partSize : (t.entry_price - price) * partSize;
-  const fees = B.calcFees(partSize, t.entry_price, price);
+async function hitTP(t, price, n) {
+  const pct   = 0.33;
+  const size  = t.position_size * pct;
+  const long  = t.direction === 'LONG';
+  const pnl   = long ? (price-t.entry_price)*size : (t.entry_price-price)*size;
+  const fees  = bingx.calcFees(size, t.entry_price, price);
+  const newSL = n===1 ? t.entry_price : t.tp1;
 
-  // Partial close on exchange
   if (process.env.BOT_MODE === 'REAL') {
-    const s = isLong ? 'SELL' : 'BUY';
-    await B.placeOrder({ symbol: t.symbol, side: s, type: 'MARKET', quantity: partSize, reduceOnly: true });
+    await bingx.closePosition(t.symbol, t.direction==='LONG'?'BUY':'SELL', size, price);
+  } else {
+    bingx.paper.updatePnl(t.symbol, price);
   }
 
-  const newSL = tpNum === 1 ? t.entry_price : t.tp1;
-  const updates = {
-    [`tp${tpNum}_hit`]: true,
-    [`tp${tpNum}_pnl`]: parseFloat(pnl.toFixed(4)),
-    stop_loss: newSL,
-    total_fees: parseFloat(((t.total_fees||0) + fees.feeClose).toFixed(6))
-  };
-  await db.updateTrade(t.id, updates);
-  tpNum === 1 ? await tg.sendTP1(t, pnl, fees.feeClose) : await tg.sendTP2(t, pnl, fees.feeClose);
-  await db.saveLog('INFO','TRADE',`TP${tpNum} hit ${t.symbol} @ ${price} PnL: +${pnl.toFixed(4)}`);
+  await db.updateTrade(t.id, {
+    [`tp${n}_hit`]: true,
+    [`tp${n}_pnl`]: parseFloat(pnl.toFixed(4)),
+    stop_loss: parseFloat(newSL.toFixed(4)),
+    total_fees: parseFloat(((+t.total_fees||0)+fees.feeClose).toFixed(6))
+  });
+
+  await dash.sendTP(t, n, pnl, fees.feeClose);
+  logger.info('EXECUTOR', `TP${n} hit ${t.symbol} @ ${price} pnl:+${pnl.toFixed(4)}`);
 }
 
-async function updateTrailing(t, price) {
-  const trail = 0.003;
-  const isLong = t.direction === 'LONG';
-  const newSL = isLong ? price * (1 - trail) : price * (1 + trail);
-  const better = isLong ? newSL > t.stop_loss : newSL < t.stop_loss;
-  if (better) await db.updateTrade(t.id, { stop_loss: parseFloat(newSL.toFixed(4)) });
-}
-
-// ─── CLOSE TRADE ─────────────────────────────────────────────
-async function closeTrade(t, closePrice, reason, sizePct = 1.0) {
-  const closeSize = t.position_size * sizePct;
-  const isLong = t.direction === 'LONG';
-  const pnl = isLong
-    ? (closePrice - t.entry_price) * closeSize
-    : (t.entry_price - closePrice) * closeSize;
-  const fees = B.calcFees(closeSize, t.entry_price, closePrice);
-  const totalFees = parseFloat(((t.total_fees||0) + fees.feeClose).toFixed(6));
-  const pnlAfterFees = pnl - totalFees;
+async function closeTrade(t, closePrice, reason, sizePct=1.0) {
+  const size  = t.position_size * sizePct;
+  const long  = t.direction === 'LONG';
+  const pnl   = long ? (closePrice-t.entry_price)*size : (t.entry_price-closePrice)*size;
+  const fees  = bingx.calcFees(size, t.entry_price, closePrice);
+  const total = parseFloat(((+t.total_fees||0)+fees.feeClose).toFixed(6));
+  const netPnl = parseFloat((pnl-total).toFixed(4));
 
   if (process.env.BOT_MODE === 'REAL') {
-    const s = isLong ? 'SELL' : 'BUY';
-    await B.placeOrder({ symbol: t.symbol, side: s, type: 'MARKET', quantity: closeSize, reduceOnly: true });
-    // Cancel SL order if exists
-    if (t.sl_order_id) await B.cancelOrder(t.symbol, t.sl_order_id).catch(()=>{});
+    await bingx.closePosition(t.symbol, t.direction==='LONG'?'BUY':'SELL', size, closePrice);
+  } else {
+    bingx.paper.closePosition(t.symbol, closePrice, reason);
   }
 
   const updated = await db.updateTrade(t.id, {
-    status: 'CLOSED',
-    close_price: closePrice,
-    pnl: parseFloat(pnl.toFixed(4)),
-    pnl_after_fees: parseFloat(pnlAfterFees.toFixed(4)),
-    pnl_percent: parseFloat(((pnl / t.risk_amount) * 100).toFixed(2)),
-    total_fees: totalFees,
-    fee_close: fees.feeClose,
-    tp3_hit: reason.includes('TRAILING') && t.tp2_hit,
-    close_reason: reason,
-    closed_at: new Date().toISOString()
+    status:'CLOSED', close_price:closePrice,
+    pnl:parseFloat(pnl.toFixed(4)),
+    pnl_after_fees:netPnl,
+    pnl_percent:parseFloat(((pnl/t.risk_amount)*100).toFixed(2)),
+    total_fees:total, fee_close:fees.feeClose,
+    tp3_hit: reason==='TRAILING_STOP' && t.tp2_hit,
+    close_reason:reason,
+    closed_at:new Date().toISOString()
   });
 
-  await tg.sendClose(updated);
-  await db.saveLog('INFO','TRADE',`Closed ${t.symbol} ${reason} PnL: ${pnlAfterFees.toFixed(4)}`);
-  return updated;
+  await dash.sendClose(updated);
+  logger.info('EXECUTOR', `Closed ${t.symbol} ${reason} @ ${closePrice} net:${netPnl>=0?'+':''}${netPnl}`);
+  return { trade:updated, pnl:netPnl };
 }
 
-async function closeAll(reason = 'EMERGENCY') {
+async function closeAll(reason='EMERGENCY') {
   const open = await db.getOpenTrades();
   for (const t of open) {
     try {
-      const price = await B.getPrice(t.symbol);
+      const price = MT.getPrice(t.symbol) || +t.entry_price;
       await closeTrade(t, price, reason);
-    } catch (e) { console.error(`Close ${t.symbol} error:`, e.message); }
+    } catch (e) { logger.error('EXECUTOR', `closeAll ${t.symbol}: ${e.message}`); }
   }
-  await tg.sendText(`🚨 <b>كل الصفقات أُغلقت</b>\nالسبب: ${reason}`);
+  await dash.send(`🚨 <b>كل الصفقات أُغلقت</b>\nالسبب: ${reason}`);
 }
 
-module.exports = { openTrade, monitorAll, closeTrade, closeAll };
+module.exports = { openTrade, monitorAll, closeTrade, closeAll, getLeverage, getTPLevels, CompoundState };
