@@ -1,403 +1,429 @@
+// ============================================================
+// AXOM v3 — Main Orchestrator
+// Bank-grade architecture: WSS-first, live dashboard,
+// AI scoring pipeline, suggestion system
+// ============================================================
 require('dotenv').config();
-const express = require('express');
-const cron = require('node-cron');
+const express  = require('express');
+const cron     = require('node-cron');
+const TgBot    = require('node-telegram-bot-api');
 
-const tg = require('./core/telegram');
-const db = require('./core/database');
-const B = require('./core/bingx');
-const G = require('./core/gemini');
-const scanner = require('./hunters/scanner');
-const executor = require('./trading/executor');
-const { DailyRisk, checkBreakers } = require('./trading/risk');
-const { CompoundingSystem } = require('./trading/compounding');
+const db       = require('./core/database');
+const bingx    = require('./core/bingx');
+const wss      = require('./core/wssEngine');
+const MT       = require('./core/marketTracker');
+const dash     = require('./core/dashboard');
+const logger   = require('./utils/logger');
+const scorer   = require('./brain/scorer');
 const { register } = require('./handlers/commands');
-const marketTracker = require('./core/marketTracker');
+const { openTrade, monitorAll, closeAll, CompoundState } = require('./trading/executor');
 
-// ─── STATE ────────────────────────────────────────────────────
-let running = false;
-let session = null;
-let riskMgr = null;
-let compound = null;
-let scanLoop = null;
-let monitorLoop = null;
-let oiLoop = null;
-let statusLoop = null;
-let ws = null;
-let pausedUntil = null;
+// ─── APP STATE ────────────────────────────────────────────────
+const appState = {
+  running:    false,
+  session:    null,
+  compound:   null,
+  openTrades: [],
+  top3:       [],
+  wss:        null,
+  pausedUntil:null,
+  scanMode:   'AUTO', // AUTO | SUGGEST | OFF
+};
 
-// ─── EXPRESS HEALTH CHECK (port 3000) ────────────────────────
+// ─── EXPRESS HEALTH CHECK ────────────────────────────────────
 const app = express();
-app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    bot: 'AXOM Trading Bot v2.0',
-    running,
-    mode: process.env.BOT_MODE || 'PAPER',
-    wsConnected: ws?.isConnected() || false,
-    session: session ? {
-      balance: session.current_balance,
-      status: session.status,
-      date: session.date
-    } : null,
-    compound: compound ? compound.getState() : null,
-    uptime: Math.round(process.uptime()),
-    timestamp: new Date().toISOString()
-  });
-});
-app.get('/health', (req, res) => res.json({ status: 'ok', ts: Date.now() }));
+app.get('/', (_, res) => res.json({
+  status:'ok', bot:'AXOM v3', running:appState.running,
+  mode: process.env.BOT_MODE||'PAPER',
+  wss:  { market: wss.isMarketConnected(), account: wss.isAccountConnected() },
+  uptime: process.uptime(), ts: Date.now()
+}));
+app.get('/health', (_, res) => res.json({ status:'ok', ts:Date.now() }));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🌐 Health check running on port ${PORT}`));
+app.listen(PORT, () => logger.info('SERVER', `Health check on :${PORT}`));
 
 // ─── START BOT ────────────────────────────────────────────────
-async function startBot(capital, stopPct) {
+async function startBot(capital, stopPct, resume = false) {
   try {
-    // Clear old loops
+    if (!capital && resume && appState.session) {
+      appState.running = true;
+      dash.startLiveDashboard();
+      return;
+    }
+
+    // Stop any existing loops
     await stopBot(true);
 
-    session = await db.createDailySession(capital, stopPct);
-    riskMgr = new DailyRisk(capital, stopPct);
-    compound = new CompoundingSystem(capital, (capital * stopPct) / 100);
-    running = true;
-    pausedUntil = null;
+    appState.session  = await db.createSession(capital, stopPct);
+    appState.compound = new CompoundState(capital, (capital * stopPct) / 100);
+    appState.running  = true;
+    appState.pausedUntil = null;
 
-    await db.saveLog('INFO', 'SYSTEM', `Bot started. Capital:$${capital} Stop:${stopPct}%`);
+    dash.setStateRef(appState);
+    dash.startLiveDashboard();
 
-    // Initial market data fetch
-    await refreshMarketData();
+    await db.saveLog('INFO','SYSTEM',`Started. Capital:$${capital} Stop:${stopPct}% Mode:${process.env.BOT_MODE}`);
+    await dash.send(`✅ <b>AXOM يعمل!</b>
 
-    // Loops
-    scanLoop    = setInterval(mainLoop, 30000);
-    monitorLoop = setInterval(monitorTrades, 10000);
-    oiLoop      = setInterval(refreshMarketData, 120000);
-    statusLoop  = setInterval(periodicStatus, 300000);
+💰 $${capital}  🛑 ${stopPct}%=$${(capital*stopPct/100).toFixed(2)}
+${process.env.BOT_MODE==='REAL'?'💰 حقيقي':process.env.BOT_MODE==='DEMO'?'🎮 ديمو':'📝 تجريبي'}
+📡 WSS: ${wss.isMarketConnected()?'🟢':'🔴'}
 
-    // Run scan immediately after 3s
-    setTimeout(mainLoop, 3000);
-
-    await tg.sendText(`✅ <b>AXOM يعمل الآن!</b>
-
-💰 رأس المال: <b>$${capital}</b>
-🛑 Daily Stop: <b>${stopPct}% = $${(capital * stopPct / 100).toFixed(2)}</b>
-📝 الوضع: <b>${process.env.BOT_MODE === 'REAL' ? 'حقيقي 💰' : 'تجريبي 📝'}</b>
-🔍 يصطاد الفرص الآن...
-
-أوامر التحكم:
-/status — حالة البوت
-/trades — الصفقات المفتوحة
-/stop — إيقاف`);
+🔍 يصطاد الفرص الآن...`);
 
   } catch (e) {
-    running = false;
-    await db.saveError('START', 'SYSTEM', e.message);
-    await tg.sendError('Bot Start', e.message);
+    logger.error('START', e.message);
+    await dash.sendError('Bot Start', e.message);
     throw e;
   }
 }
 
-// ─── STOP BOT ─────────────────────────────────────────────────
+// ─── STOP BOT ────────────────────────────────────────────────
 async function stopBot(silent = false) {
-  running = false;
-  if (scanLoop)    { clearInterval(scanLoop);    scanLoop = null; }
-  if (monitorLoop) { clearInterval(monitorLoop); monitorLoop = null; }
-  if (oiLoop)      { clearInterval(oiLoop);      oiLoop = null; }
-  if (statusLoop)  { clearInterval(statusLoop);  statusLoop = null; }
-
-  if (session && !silent) {
-    await db.updateSession(session.id, {
-      status: 'STOPPED',
-      stopped_at: new Date().toISOString()
-    });
-    session = null;
+  appState.running = false;
+  dash.stopLiveDashboard();
+  if (appState.session && !silent) {
+    await db.updateSession(appState.session.id, { status:'STOPPED', stopped_at:new Date().toISOString() });
+    appState.session = null;
   }
-  if (!silent) {
-    await db.saveLog('INFO', 'SYSTEM', 'Bot stopped');
-  }
+  if (!silent) await db.saveLog('INFO','SYSTEM','Bot stopped');
 }
 
-// ─── REFRESH MARKET DATA (OI, Funding) ───────────────────────
-async function refreshMarketData() {
-  const symbols = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT'];
-  for (const sym of symbols) {
-    try {
-      const [oi, fund] = await Promise.all([B.getOI(sym), B.getFunding(sym)]);
-      marketTracker.updateOI(sym, oi);
-      marketTracker.updateFunding(sym, fund.fundingRate);
-    } catch (e) {
-      // Non-critical — continue
-    }
-  }
-}
-
-// ─── MONITOR OPEN TRADES ─────────────────────────────────────
-async function monitorTrades() {
-  if (!running) return;
-  try {
-    await executor.monitorAll(marketTracker.getAllPrices());
-  } catch (e) {
-    console.error('Monitor error:', e.message);
-  }
-}
-
-// ─── MAIN SCAN LOOP ──────────────────────────────────────────
+// ─── MAIN SCAN LOOP (every 30s) ──────────────────────────────
 async function mainLoop() {
-  if (!running || !session || !riskMgr) return;
-
-  // Pause check
-  if (pausedUntil && Date.now() < pausedUntil) return;
-  if (pausedUntil && Date.now() >= pausedUntil) {
-    pausedUntil = null;
-    await tg.sendText('▶️ <b>انتهت الاستراحة</b> — AXOM يعمل من جديد!');
+  if (!appState.running || !appState.session) return;
+  if (appState.pausedUntil && Date.now() < appState.pausedUntil) return;
+  if (appState.pausedUntil && Date.now() >= appState.pausedUntil) {
+    appState.pausedUntil = null;
+    await dash.send('▶️ <b>انتهت الاستراحة</b> — AXOM يعمل!');
   }
 
   try {
-    // 1. Refresh session
-    session = await db.getActiveSession();
-    if (!session) { running = false; return; }
+    // Refresh session
+    appState.session = await db.getActiveSession();
+    if (!appState.session) { appState.running = false; return; }
 
-    // 2. Compound stop checks
-    if (compound) {
-      const check = compound.checkStops();
-      if (check.action === 'STOP') {
+    // Compound stop checks
+    const cs = appState.compound;
+    if (cs) {
+      const chk = cs.shouldStop();
+      if (chk.stop) {
+        if (chk.ask) {
+          await stopBot();
+          await dash.sendProfitLock(cs.balance, cs.high);
+          return;
+        }
         await stopBot();
-        if (check.reason === 'DAILY_STOP') {
-          await tg.sendDailyStop(riskMgr.start - riskMgr.balance, riskMgr.stopAmount);
-        } else {
-          await tg.sendText(`🔒 <b>Profit Lock</b>\n${check.message}`);
+        if (chk.reason==='DAILY_STOP') {
+          await dash.sendDailyStop(cs.baseRisk-cs.balance, cs.stopAmount);
         }
         return;
       }
-      if (check.action === 'ASK') {
-        await stopBot();
-        await tg.sendProfitLock(compound.currentBalance, compound.dailyHigh, compound.dailyHigh * 0.5);
-        return;
-      }
-      if (check.action === 'PAUSE' && !pausedUntil) {
-        pausedUntil = Date.now() + check.duration * 60000;
-        await tg.sendText(`⏸️ <b>استراحة مؤقتة</b>\n${check.message}`);
-        await db.saveLog('WARN', 'RISK', `Paused: ${check.reason}`);
+      const pause = cs.shouldPause();
+      if (pause.pause && !appState.pausedUntil) {
+        appState.pausedUntil = Date.now() + pause.mins * 60000;
+        await dash.send(`⏸️ <b>استراحة</b> ${pause.reason}`);
         return;
       }
     }
 
-    // 3. Check open trades limit & daily limit
-    const openTrades = await db.getOpenTrades();
-    const settings = await db.getSettings();
-    if (openTrades.length >= (settings.max_concurrent_trades || 3)) return;
-
-    const todayTrades = await db.getTodayTrades();
-    if (todayTrades.length >= (settings.max_daily_trades || 15)) return;
-
-    // 4. Flash crash check
-    const btcPrice = marketTracker.getPrice('BTCUSDT');
-    if (btcPrice && marketTracker.isFlashCrash('BTCUSDT')) {
-      await executor.closeAll('FLASH_CRASH');
-      await tg.sendError('CIRCUIT BREAKER', 'Flash crash detected on BTC!');
-      pausedUntil = Date.now() + 30 * 60000; // pause 30 min
+    // Flash crash check
+    if (MT.isFlashCrash('BTCUSDT')) {
+      await closeAll('FLASH_CRASH');
+      await dash.sendError('CIRCUIT BREAKER','Flash crash on BTC');
+      appState.pausedUntil = Date.now() + 30*60000;
       return;
     }
 
-    // 5. Scan for opportunity
-    const opp = await scanner.scan(openTrades);
+    // Trade limits
+    appState.openTrades = await db.getOpenTrades();
+    const settings      = await db.getSettings();
+    if (appState.openTrades.length >= (settings.max_concurrent_trades||3)) return;
 
-    if (opp && opp.decision === 'APPROVE' && opp.score >= 75) {
-      // Use compound risk
-      const currentRisk = compound ? compound.getCurrentRisk() : session.start_capital;
-      opp.risk_override = currentRisk;
+    const todayTrades = await db.getTodayTrades();
+    if (todayTrades.length >= (settings.max_daily_trades||15)) return;
 
-      // Add leverage bonus from streak
-      if (compound) opp.leverage = Math.min(50, opp.leverage + compound.getLeverageBonus());
-
-      const trade = await executor.openTrade(opp, session, riskMgr);
-
-      // Send scan update
-      await tg.sendScanUpdate(opp.symbol, opp.score, opp.direction, opp.liquidity_score || 0);
+    // Balance check before scanning
+    try {
+      const balInfo = await bingx.getBalance();
+      if (balInfo.available < 1) {
+        logger.warn('LOOP','Balance too low to trade');
+        await dash.sendBalanceAlert(balInfo.available, balInfo.mode);
+        return;
+      }
+    } catch (e) {
+      logger.error('LOOP',`Balance check: ${e.message}`);
     }
 
-    // 6. Update stats
+    // SCAN
+    if (appState.scanMode === 'OFF') return;
+
+    const topSymbols = await bingx.getTopSymbols(30);
+    const { top3, best } = await scorer.rankCandidates(topSymbols.slice(0,20));
+    appState.top3 = top3;
+
+    // Save top signals
+    for (const sig of top3) {
+      await db.saveSignal({
+        symbol: sig.symbol, total_score: sig.score,
+        decision: sig.decision, direction: sig.direction,
+        entry_price: sig.entry, stop_loss: sig.sl,
+        tp1: sig.tp1, tp2: sig.tp2, leverage: sig.leverage,
+        reject_reason: sig.reject_reason,
+        gemini_summary: sig.summary,
+        kill_zone: sig.kz?.zone
+      }).catch(()=>{});
+    }
+
+    // SUGGEST mode: propose to user, don't auto-execute
+    if (appState.scanMode === 'SUGGEST' && best) {
+      const existing = await db.getPendingSuggestions();
+      const alreadyExists = existing.some(s=>s.symbol===best.symbol);
+      if (!alreadyExists) {
+        const sug = await db.saveSuggestion({
+          symbol: best.symbol, score: best.score,
+          direction: best.direction, entry_price: best.entry,
+          stop_loss: best.sl, tp1: best.tp1, tp2: best.tp2,
+          leverage: best.leverage, summary: best.summary,
+          confidence: best.confidence, status:'PENDING'
+        });
+        const { suggestionKB } = require('./handlers/commands');
+        await dash.send(
+`💡 <b>اقتراح جديد</b>
+
+${best.direction==='LONG'?'🟢 LONG':'🔴 SHORT'} <b>${best.symbol}</b>
+📊 Score: <b>${best.score}</b>  ⚡ x${best.leverage}
+${best.confidence==='HIGH'?'🔥':'⚠️'} ${best.confidence}
+
+📍 $${best.entry?.toFixed(4)||'?'}  🛑 $${best.sl?.toFixed(4)||'?'}
+🎯 TP1: $${best.tp1?.toFixed(4)||'?'}
+
+📝 ${best.summary}`,
+          suggestionKB(sug.id));
+      }
+      return;
+    }
+
+    // AUTO mode: execute best opportunity
+    if (appState.scanMode === 'AUTO' && best) {
+      const trade = await openTrade(best, appState.session, appState.compound);
+      appState.openTrades.push(trade);
+    }
+
+    // Update stats
     await updateStats();
 
   } catch (e) {
-    console.error('Main loop error:', e.message);
-    await db.saveError('MAIN_LOOP', 'SYSTEM', e.message);
+    logger.error('MAIN_LOOP', e.message);
+    await db.saveError('MAIN_LOOP','SYSTEM',e.message);
   }
 }
 
-// ─── PERIODIC STATUS (every 5 min) ───────────────────────────
-async function periodicStatus() {
-  if (!running || !session) return;
+// ─── MONITOR LOOP (every 10s) ────────────────────────────────
+async function monitorLoop() {
+  if (!appState.running) return;
   try {
-    const [open, statsArr] = await Promise.all([
-      db.getOpenTrades(),
-      db.getDailyStats(1)
-    ]);
-    const stats = statsArr[0] || {};
-    const cs = compound?.getState() || {};
-    const wsOk = ws?.isConnected();
-
-    await tg.sendText(`📡 <b>AXOM — تحديث دوري</b>
-
-${running ? '🟢 نشط' : '🔴 موقوف'}  ${wsOk ? '🟢' : '🔴'} WS  ${process.env.BOT_MODE === 'REAL' ? '💰' : '📝'}
-
-💰 رأس المال: $${(+session.start_capital).toFixed(2)}
-📊 الرصيد: <b>$${(cs.balance || session.current_balance || 0).toFixed(4)}</b>
-📈 أعلى: $${(cs.dailyHigh || 0).toFixed(4)}
-🪜 Ladder: x${cs.ladderMultiplier || 1}  🎯 Streak: ${cs.consecutiveWins || 0}
-
-🔄 مفتوحة: ${open.length}  📊 اليوم: ${stats.total_trades || 0}
-✅ Win Rate: ${stats.win_rate?.toFixed(1) || 0}%
-💸 رسوم اليوم: $${(stats.total_fees || 0).toFixed(4)}
-📋 آخر 5: ${cs.last5 || '—'}`);
+    await monitorAll(MT.getAllPrices());
+    appState.openTrades = await db.getOpenTrades();
   } catch (e) {
-    console.error('Status error:', e.message);
+    logger.error('MONITOR', e.message);
   }
 }
 
-// ─── UPDATE DAILY STATS ───────────────────────────────────────
+// ─── OI + FUNDING REFRESH (every 2min) ───────────────────────
+async function refreshMarketData() {
+  const symbols = ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT'];
+  for (const s of symbols) {
+    try {
+      const [oi, fund] = await Promise.all([bingx.getOI(s), bingx.getFunding(s)]);
+      MT.setOI(s, oi);
+      MT.setFunding(s, fund.fundingRate);
+    } catch {}
+  }
+}
+
+// ─── UPDATE STATS ────────────────────────────────────────────
 async function updateStats() {
   try {
-    const today = await db.getTodayTrades();
-    const closed = today.filter(t => t.status === 'CLOSED');
-    const wins = closed.filter(t => (t.pnl_after_fees || 0) > 0);
-    const totalPnl = closed.reduce((s, t) => s + (t.pnl || 0), 0);
-    const totalFees = closed.reduce((s, t) => s + (t.total_fees || 0), 0);
-    const pnls = closed.map(t => t.pnl_after_fees || 0);
-
-    await db.upsertDailyStats({
-      mode: process.env.BOT_MODE || 'PAPER',
+    const today  = await db.getTodayTrades();
+    const closed = today.filter(t=>t.status==='CLOSED');
+    const wins   = closed.filter(t=>(t.pnl_after_fees||0)>0);
+    const pnl    = closed.reduce((s,t)=>s+(t.pnl||0),0);
+    const fees   = closed.reduce((s,t)=>s+(t.total_fees||0),0);
+    await db.upsertStats({
+      mode: process.env.BOT_MODE||'PAPER',
       total_trades: closed.length,
       winning_trades: wins.length,
-      losing_trades: closed.length - wins.length,
-      win_rate: closed.length > 0 ? (wins.length / closed.length) * 100 : 0,
-      total_pnl: totalPnl,
-      total_fees: totalFees,
-      net_pnl: totalPnl - totalFees,
-      best_trade_pnl: pnls.length ? Math.max(...pnls) : 0,
-      worst_trade_pnl: pnls.length ? Math.min(...pnls) : 0,
-      avg_score: closed.length > 0 ? closed.reduce((s, t) => s + (t.score || 0), 0) / closed.length : 0,
-      avg_leverage: closed.length > 0 ? closed.reduce((s, t) => s + (t.leverage || 0), 0) / closed.length : 0
+      losing_trades: closed.length-wins.length,
+      win_rate: closed.length>0?(wins.length/closed.length)*100:0,
+      total_pnl: pnl, total_fees: fees, net_pnl: pnl-fees,
+      best_trade_pnl:  closed.length?Math.max(...closed.map(t=>t.pnl_after_fees||0)):0,
+      worst_trade_pnl: closed.length?Math.min(...closed.map(t=>t.pnl_after_fees||0)):0
     });
-
-    // Update session
-    if (session) {
-      const newBal = compound?.currentBalance || session.start_capital;
-      session = await db.updateSession(session.id, {
-        total_pnl: totalPnl,
-        total_fees: totalFees,
-        net_pnl: totalPnl - totalFees,
-        total_trades: closed.length,
-        winning_trades: wins.length,
-        current_balance: parseFloat(newBal.toFixed(4)),
-        daily_high: parseFloat((compound?.dailyHigh || newBal).toFixed(4))
+    if (appState.session) {
+      const bal = appState.compound?.balance || +appState.session.start_capital;
+      appState.session = await db.updateSession(appState.session.id,{
+        total_pnl:pnl, total_fees:fees, net_pnl:pnl-fees,
+        total_trades:closed.length, winning_trades:wins.length,
+        current_balance:parseFloat(bal.toFixed(4)),
+        daily_high:parseFloat((appState.compound?.high||bal).toFixed(4))
       });
     }
-
-    // Update compound with latest closed trade if any
-    if (closed.length > 0 && compound) {
-      const lastTrade = closed[closed.length - 1];
-      if (lastTrade.closed_at) {
-        const closedAt = new Date(lastTrade.closed_at).getTime();
-        const fiveSecsAgo = Date.now() - 5000;
-        if (closedAt > fiveSecsAgo) {
-          // Just closed — update compound
-          compound.recordTrade(lastTrade.pnl || 0, lastTrade.total_fees || 0);
-        }
+    if (appState.compound && closed.length>0) {
+      const last = closed.at(-1);
+      const lastTs = new Date(last.closed_at||0).getTime();
+      if (Date.now()-lastTs<35000) {
+        appState.compound.update(last.pnl_after_fees||0);
       }
     }
-  } catch (e) {
-    console.error('updateStats error:', e.message);
-  }
+  } catch (e) { logger.warn('STATS',e.message); }
 }
 
-// ─── WEBSOCKET ────────────────────────────────────────────────
-function startWS() {
-  ws = new B.AxomWebSocket();
-
-  ws.onPrice(tick => {
-    marketTracker.updatePrice(tick.symbol, tick.price);
-  });
-
-  ws.onLiquidation(liq => {
-    if (liq.symbol && liq.value) {
-      marketTracker.addLiquidation(liq.symbol, liq.value);
-      scanner.trackLiquidation(liq);
+// ─── DAILY SUGGESTION SCAN (every hour) ─────────────────────
+async function dailySuggestionScan() {
+  logger.info('SUGGEST','Running hourly suggestion scan...');
+  try {
+    const topSymbols = await bingx.getTopSymbols(20);
+    const { top3 }   = await scorer.rankCandidates(topSymbols.slice(0,15));
+    for (const sig of top3.filter(s=>s.decision==='APPROVE'&&s.score>=75)) {
+      await db.saveSuggestion({
+        symbol:sig.symbol, score:sig.score,
+        direction:sig.direction, entry_price:sig.entry,
+        stop_loss:sig.sl, tp1:sig.tp1, tp2:sig.tp2,
+        leverage:sig.leverage, summary:sig.summary,
+        confidence:sig.confidence, status:'PENDING'
+      });
     }
-  });
-
-  const symbols = ['btcusdt', 'ethusdt', 'solusdt', 'bnbusdt', 'xrpusdt'];
-  ws.connect(symbols);
-  console.log(`✅ WebSocket started (${symbols.length} pairs)`);
+    if (top3.some(s=>s.decision==='APPROVE')) {
+      logger.info('SUGGEST',`Found ${top3.filter(s=>s.decision==='APPROVE').length} suggestion(s)`);
+    }
+  } catch (e) { logger.error('SUGGEST',e.message); }
 }
 
-// ─── MIDNIGHT RESET ───────────────────────────────────────────
-cron.schedule('0 0 * * *', async () => {
-  console.log('🌙 Midnight reset...');
-  const prevSession = await db.getTodaySession();
-  await stopBot();
+// ─── WEBSOCKET SETUP ─────────────────────────────────────────
+function startWSS() {
+  appState.wss = wss;
 
-  if (prevSession) {
-    const statsArr = await db.getDailyStats(1);
-    const stats = statsArr[0] || {};
-    await tg.sendDailyReport(prevSession, stats);
+  // Price feed → MarketTracker
+  wss.onPrice(tick => { MT.setPrice(tick.symbol, tick.price); });
+
+  // Liquidations
+  wss.onLiquidation(liq => { if(liq.symbol && liq.value) MT.addLiquidation(liq.symbol, liq.value); });
+
+  // Account order updates (real/demo mode)
+  wss.onOrderUpdate(async data => {
+    logger.info('ACCOUNT', `Order update: ${JSON.stringify(data).substring(0,100)}`);
+  });
+
+  const symbols = ['btcusdt','ethusdt','solusdt','bnbusdt','xrpusdt'];
+  wss.connectMarket(symbols);
+
+  // Account channel (only if API keys set)
+  if (process.env.BINGX_API_KEY && process.env.BINGX_API_KEY !== 'your_bingx_api_key_here') {
+    wss.connectAccount();
+  } else {
+    logger.warn('WSS','No BingX API keys — account channel skipped');
   }
 
-  await tg.sendText('🌙 <b>انتهى اليوم</b>\nأرسل /start_day لبدء يوم جديد.');
-  await db.saveLog('INFO', 'SYSTEM', 'Daily reset completed');
-}, { timezone: 'UTC' });
+  logger.info('WSS',`Market channel connecting (${symbols.length} pairs)`);
+}
 
-// ─── GLOBAL ERROR HANDLERS ────────────────────────────────────
+// ─── CRON JOBS ───────────────────────────────────────────────
+function setupCrons() {
+  // Midnight reset
+  cron.schedule('0 0 * * *', async () => {
+    logger.info('CRON','Midnight reset');
+    const prevSession = await db.getTodaySession();
+    await stopBot();
+    if (prevSession) {
+      const stats = (await db.getDailyStats(1))[0]||{};
+      await dash.sendDailyReport(prevSession, stats);
+    }
+    await dash.send('🌙 <b>انتهى اليوم</b>\n/start_day لبدء يوم جديد.');
+  }, { timezone:'UTC' });
+
+  // Hourly suggestions
+  cron.schedule('0 * * * *', dailySuggestionScan);
+
+  // Expire old suggestions (> 4 hours)
+  cron.schedule('*/30 * * * *', async () => {
+    const cutoff = new Date(Date.now() - 4*3600000).toISOString();
+    await db.updateSuggestion('expired_cleanup',{status:'EXPIRED'});
+  });
+}
+
+// ─── GLOBAL ERROR HANDLERS ───────────────────────────────────
 process.on('uncaughtException', async e => {
-  console.error('CRASH:', e.message);
-  await db.saveError('CRASH', 'SYSTEM', e.message, { stack: e.stack }).catch(() => {});
-  await tg.sendError('CRASH', e.message).catch(() => {});
+  logger.error('CRASH', e.message, { stack:e.stack?.substring(0,300) });
+  await dash.sendError('CRASH', e.message).catch(()=>{});
+});
+process.on('unhandledRejection', async r => {
+  const msg = r instanceof Error ? r.message : String(r);
+  logger.error('REJECTION', msg);
+  await db.saveError('REJECTION','SYSTEM',msg).catch(()=>{});
 });
 
-process.on('unhandledRejection', async reason => {
-  const msg = reason instanceof Error ? reason.message : String(reason);
-  console.error('REJECTION:', msg);
-  await db.saveError('REJECTION', 'SYSTEM', msg).catch(() => {});
-});
-
-// ─── MAIN ENTRY ───────────────────────────────────────────────
+// ─── MAIN ────────────────────────────────────────────────────
 async function main() {
   console.log('');
-  console.log('╔══════════════════════════════╗');
-  console.log('║    AXOM Trading Bot v2.0     ║');
-  console.log('║    ICT/SMC Elite System      ║');
-  console.log('╚══════════════════════════════╝');
+  console.log('╔════════════════════════════════╗');
+  console.log('║    AXOM Trading Bot v3.0        ║');
+  console.log('║    ICT/SMC Elite System         ║');
+  console.log('║    WSS-First Architecture       ║');
+  console.log('╚════════════════════════════════╝');
   console.log('');
 
   try {
+    // Init logger (without DB initially)
+    logger.init(null, null);
+
+    // Test DB
+    await db.getSettings();
+    logger.info('DB','Connected ✅');
+
     // Init AI
-    G.init();
-    console.log('✅ Gemini AI initialized');
+    scorer.initGemini();
+    logger.info('AI','Gemini initialized ✅');
 
     // Init Telegram
-    const bot = tg.init();
-    console.log('✅ Telegram bot initialized');
+    const bot = new TgBot(process.env.TELEGRAM_BOT_TOKEN, { polling:true });
+    const cid = process.env.TELEGRAM_CHAT_ID;
+    dash.init(bot, cid);
+    dash.setStateRef(appState);
+    dash.resetDashMsg();
 
-    // Register command handlers
+    // Init logger with telegram
+    logger.init({ saveLog: db.saveLog, saveError: db.saveError }, dash.send);
+
+    // Register commands
     register(bot, startBot, stopBot);
-    console.log('✅ Commands registered');
+    logger.info('TG','Bot commands registered ✅');
 
-    // Test DB connection
-    await db.getSettings();
-    console.log('✅ Database connected');
-
-    // Start WebSocket
-    startWS();
+    // Start WSS
+    startWSS();
 
     // Initial market data
     await refreshMarketData();
-    console.log('✅ Market data loaded');
+    logger.info('MARKET','Initial data loaded ✅');
+
+    // Setup crons
+    setupCrons();
+    logger.info('CRON','Scheduled tasks active ✅');
+
+    // Start loops
+    setInterval(mainLoop,    30000);  // scan every 30s
+    setInterval(monitorLoop, 10000);  // monitor every 10s
+    setInterval(refreshMarketData, 120000); // OI/funding every 2min
+    setInterval(() => dash.update(), 1500); // dashboard every 1.5s
 
     console.log('');
-    console.log('✅ AXOM is READY! Send /start in Telegram.');
+    logger.info('AXOM','✅ Ready! Send /start in Telegram.');
     console.log('');
 
-    await tg.sendText(`🟢 <b>AXOM Bot Online!</b>
+    await dash.send(`🟢 <b>AXOM v3 Online!</b>
 
-النظام جاهز للتداول.
-أرسل /start_day للبدء.
+النظام جاهز.
+/start_day لبدء التداول.
 
 ⏰ ${new Date().toLocaleString('ar-SA')}`);
 
@@ -406,5 +432,8 @@ async function main() {
     process.exit(1);
   }
 }
+
+// Expose scanMode control
+global.setScanMode = m => { appState.scanMode = m; };
 
 main();
