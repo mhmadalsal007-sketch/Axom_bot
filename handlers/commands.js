@@ -1,352 +1,368 @@
 // ============================================================
-// AXOM — Complete Command Handlers with Button System
+// AXOM — Telegram Command Handlers + Keyboard System
+// Includes: suggestion approval, live controls, AI chat
 // ============================================================
-const db = require('../core/database');
-const tg = require('../core/telegram');
-const G = require('../core/gemini');
+const db    = require('../core/database');
+const dash  = require('../core/dashboard');
+const G     = require('../core/gemini');
 const { closeAll } = require('../trading/executor');
-const KB = require('./keyboards');
+const bingx = require('../core/bingx');
+const MT    = require('../core/marketTracker');
 
 const userState = {};
-function setState(id, s) { userState[id] = s; }
-function getState(id)    { return userState[id] || {}; }
-function clearState(id)  { delete userState[id]; }
+const setState  = (id,s) => { userState[id] = s; };
+const getState  = id => userState[id] || {};
+const clearState= id => { delete userState[id]; };
 
-let _startBot, _stopBot;
+// ─── KEYBOARDS ────────────────────────────────────────────────
+const mainMenu = { reply_markup:{ keyboard:[
+  [{ text:'🚀 بدء يوم' }, { text:'📡 الحالة' }],
+  [{ text:'🔄 صفقات'  }, { text:'📊 إحصائيات' }],
+  [{ text:'💡 اقتراحات'}, { text:'🔍 فرص السوق' }],
+  [{ text:'⚙️ إعدادات'}, { text:'🆘 مساعدة' }]
+], resize_keyboard:true, persistent:true }};
 
+const capitalKB = { reply_markup:{ inline_keyboard:[
+  [{ text:'$5',  callback_data:'cap_5'  }, { text:'$10', callback_data:'cap_10' }],
+  [{ text:'$20', callback_data:'cap_20' }, { text:'$50', callback_data:'cap_50' }],
+  [{ text:'✏️ مخصص', callback_data:'cap_custom' }],
+  [{ text:'❌ إلغاء',  callback_data:'cancel' }]
+]}};
+
+function stopKB(cap) { return { reply_markup:{ inline_keyboard:[
+  [{ text:'10%', callback_data:`stp_10` }, { text:'30%', callback_data:`stp_30` }],
+  [{ text:'50%', callback_data:`stp_50` }, { text:'60%', callback_data:`stp_60` }],
+  [{ text:'70%', callback_data:`stp_70` }, { text:'80%', callback_data:`stp_80` }],
+  [{ text:'✏️ مخصص', callback_data:'stp_custom' }],
+  [{ text:'❌ إلغاء',  callback_data:'cancel' }]
+]}}; }
+
+function confirmKB(cap, stp) { return { reply_markup:{ inline_keyboard:[
+  [{ text:`✅ ابدأ ($${cap}, ${stp}%)`, callback_data:`confirm_${cap}_${stp}` }],
+  [{ text:'🔄 تغيير', callback_data:'change_settings' }, { text:'❌ إلغاء', callback_data:'cancel' }]
+]}}; }
+
+const modeKB = { reply_markup:{ inline_keyboard:[
+  [{ text:'📝 تجريبي (Paper)', callback_data:'mode_PAPER' }],
+  [{ text:'🎮 ديمو (BingX Demo)', callback_data:'mode_DEMO' }],
+  [{ text:'💰 حقيقي ⚠️',       callback_data:'mode_REAL' }],
+  [{ text:'❌ إلغاء', callback_data:'cancel' }]
+]}};
+
+function suggestionKB(id) { return { reply_markup:{ inline_keyboard:[
+  [{ text:'✅ أوافق — نفّذ', callback_data:`sug_approve_${id}` }],
+  [{ text:'❌ ارفض',          callback_data:`sug_reject_${id}`  }]
+]}}; }
+
+const emergencyKB = { reply_markup:{ inline_keyboard:[
+  [{ text:'🚨 إغلاق كل الصفقات', callback_data:'emergency_close' }],
+  [{ text:'⏸️ إيقاف مؤقت',      callback_data:'pause_bot'       }],
+  [{ text:'❌ إلغاء',             callback_data:'cancel'          }]
+]}};
+
+const confirmStopKB = { reply_markup:{ inline_keyboard:[
+  [{ text:'✅ أوقف', callback_data:'confirm_stop' }, { text:'❌ إلغاء', callback_data:'cancel' }]
+]}};
+
+let _start, _stop;
+
+// ─── REGISTER ────────────────────────────────────────────────
 function register(bot, startFn, stopFn) {
-  _startBot = startFn;
-  _stopBot  = stopFn;
+  _start = startFn; _stop = stopFn;
 
-  // /start
   bot.onText(/\/start$/, async msg => {
-    const chatId = msg.chat.id;
-    process.env.TELEGRAM_CHAT_ID = chatId.toString();
-    clearState(chatId);
-    await bot.sendMessage(chatId,
-`╔═══════════════════════╗
-║    🤖 AXOM Trading Bot  ║
-║    Elite ICT/SMC System ║
-╚═══════════════════════╝
+    process.env.TELEGRAM_CHAT_ID = msg.chat.id.toString();
+    clearState(msg.chat.id);
+    await dash.send(`╔══════════════════════════╗
+║    🤖 AXOM Trading Bot    ║
+║    Elite ICT/SMC System  ║
+╚══════════════════════════╝
 
-مرحباً! أنا <b>AXOM</b> — نظام تداول ذكي 24/7
-يحلل السوق بمنهج ICT/SMC ويصطاد الفرص
+مرحباً! AXOM جاهز للتداول.
+الوضع: ${process.env.BOT_MODE==='REAL'?'💰 حقيقي':process.env.BOT_MODE==='DEMO'?'🎮 ديمو':'📝 تجريبي'}
 
-الوضع: ${process.env.BOT_MODE === 'REAL' ? '💰 حقيقي' : '📝 تجريبي'}
-
-اختر من القائمة 👇`,
-      { parse_mode: 'HTML', ...KB.mainMenu });
+اختر من القائمة 👇`, mainMenu);
   });
 
   // Text buttons
   bot.on('message', async msg => {
     if (!msg.text || msg.text.startsWith('/')) return;
-    const chatId = msg.chat.id;
-    const text   = msg.text;
+    const cid = msg.chat.id, txt = msg.text;
+    const state = getState(cid);
 
-    if (text === '🚀 بدء يوم جديد') return startDayFlow(bot, chatId);
-    if (text === '📡 الحالة')        return showStatus(bot, chatId);
-    if (text === '🔄 الصفقات')       return showTrades(bot, chatId);
-    if (text === '📊 الإحصائيات')    return bot.sendMessage(chatId, '📊 اختر الفترة:', KB.statsPeriodMenu);
-    if (text === '🔍 فرص السوق')     return showMarket(bot, chatId);
-    if (text === '📈 الأداء')        return showPerformance(bot, chatId);
-    if (text === '⚙️ الإعدادات')     return showSettings(bot, chatId);
-    if (text === '🆘 مساعدة')        return showHelp(bot, chatId);
+    if (txt === '🚀 بدء يوم')    return showStartDay(bot, cid);
+    if (txt === '📡 الحالة')     return showStatus(bot, cid);
+    if (txt === '🔄 صفقات')      return showTrades(bot, cid);
+    if (txt === '📊 إحصائيات')   return showStats(bot, cid);
+    if (txt === '💡 اقتراحات')   return showSuggestions(bot, cid);
+    if (txt === '🔍 فرص السوق')  return showMarket(bot, cid);
+    if (txt === '⚙️ إعدادات')    return showSettings(bot, cid);
+    if (txt === '🆘 مساعدة')     return showHelp(bot, cid);
 
-    // Multi-step: custom capital
-    const state = getState(chatId);
-    if (state.step === 'custom_capital') {
-      const n = parseFloat(text);
-      if (isNaN(n) || n < 5) return bot.sendMessage(chatId, '❌ أدخل مبلغاً صحيحاً (الحد الأدنى $5):');
-      setState(chatId, { step: 'pick_stop', capital: n });
-      return bot.sendMessage(chatId,
-        `💰 رأس المال: <b>$${n}</b>\n\nاختر نسبة الـ Daily Stop:`,
-        { parse_mode: 'HTML', ...KB.stopMenu(n) });
+    // Multi-step inputs
+    if (state.step === 'custom_cap') {
+      const n = parseFloat(txt);
+      if (isNaN(n)||n<5) return bot.sendMessage(cid,'❌ الحد الأدنى $5:');
+      setState(cid,{step:'pick_stop',capital:n});
+      return bot.sendMessage(cid,`💰 $${n}\nاختر نسبة الـ Stop:`, stopKB(n));
     }
     if (state.step === 'custom_stop') {
-      const n = parseFloat(text);
-      if (isNaN(n) || n < 5 || n > 95) return bot.sendMessage(chatId, '❌ النسبة بين 5 و 95:');
-      setState(chatId, { step: 'confirm', capital: state.capital, stop: n });
-      return showConfirm(bot, chatId, state.capital, n);
+      const n = parseFloat(txt);
+      if (isNaN(n)||n<5||n>95) return bot.sendMessage(cid,'❌ النسبة 5-95:');
+      setState(cid,{step:'confirm',capital:state.capital,stop:n});
+      return bot.sendMessage(cid,buildConfirmText(state.capital,n), confirmKB(state.capital,n));
     }
 
     // AI chat
-    await chatAI(bot, chatId, text);
+    await handleChat(bot, cid, txt);
   });
 
-  // Callback queries
-  bot.on('callback_query', async query => {
-    const chatId = query.message.chat.id;
-    const msgId  = query.message.message_id;
-    const data   = query.data;
-    await bot.answerCallbackQuery(query.id);
+  // Callbacks
+  bot.on('callback_query', async q => {
+    const cid  = q.message.chat.id;
+    const mid  = q.message.message_id;
+    const data = q.data;
+    await bot.answerCallbackQuery(q.id);
 
-    // Capital pick
-    if (data.startsWith('capital_')) {
-      const val = data.slice(8);
-      if (val === 'custom') {
-        setState(chatId, { step: 'custom_capital' });
-        return bot.editMessageText('✏️ أرسل المبلغ بالدولار (مثال: 15):', { chat_id: chatId, message_id: msgId });
+    // Capital
+    if (data.startsWith('cap_')) {
+      const val = data.slice(4);
+      if (val==='custom') {
+        setState(cid,{step:'custom_cap'});
+        return bot.editMessageText('✏️ أرسل المبلغ:', {chat_id:cid,message_id:mid});
       }
-      const capital = parseFloat(val);
-      setState(chatId, { step: 'pick_stop', capital });
-      return bot.editMessageText(
-        `💰 رأس المال: <b>$${capital}</b>\n\nاختر نسبة الـ Daily Stop:`,
-        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...KB.stopMenu(capital) });
+      const cap = parseFloat(val);
+      setState(cid,{step:'pick_stop',capital:cap});
+      return bot.editMessageText(`💰 $${cap}\nاختر نسبة الـ Stop:`, {chat_id:cid,message_id:mid,...stopKB(cap)});
     }
 
-    // Stop pick
-    if (data.startsWith('stop_')) {
-      const state   = getState(chatId);
-      const capital = state.capital || 10;
-      const val     = data.slice(5);
-      if (val === 'custom') {
-        setState(chatId, { ...state, step: 'custom_stop' });
-        return bot.editMessageText('✏️ أرسل نسبة الـ Stop (مثال: 65):', { chat_id: chatId, message_id: msgId });
+    // Stop
+    if (data.startsWith('stp_')) {
+      const state = getState(cid), cap = state.capital||10;
+      const val = data.slice(4);
+      if (val==='custom') {
+        setState(cid,{...state,step:'custom_stop'});
+        return bot.editMessageText('✏️ أرسل نسبة الـ Stop (5-95):', {chat_id:cid,message_id:mid});
       }
-      const stop = parseFloat(val);
-      setState(chatId, { step: 'confirm', capital, stop });
-      await bot.deleteMessage(chatId, msgId).catch(() => {});
-      return showConfirm(bot, chatId, capital, stop);
+      const stp = parseFloat(val);
+      setState(cid,{step:'confirm',capital:cap,stop:stp});
+      await bot.deleteMessage(cid,mid).catch(()=>{});
+      return bot.sendMessage(cid,buildConfirmText(cap,stp), confirmKB(cap,stp));
     }
 
     // Confirm start
-    if (data.startsWith('confirm_start_')) {
-      const [,,cap, stp] = data.split('_');
-      clearState(chatId);
-      await bot.editMessageText('⏳ جارٍ تشغيل AXOM...', { chat_id: chatId, message_id: msgId }).catch(() => {});
-      return _startBot(parseFloat(cap), parseFloat(stp));
+    if (data.startsWith('confirm_')) {
+      const [,cap,stp] = data.split('_');
+      clearState(cid);
+      await bot.editMessageText('⏳ جارٍ التشغيل...', {chat_id:cid,message_id:mid}).catch(()=>{});
+      return _start(parseFloat(cap), parseFloat(stp));
     }
 
-    if (data === 'change_settings') {
-      return bot.editMessageText('💰 اختر رأس المال:', { chat_id: chatId, message_id: msgId, ...KB.startDayMenu });
-    }
+    if (data==='change_settings') return bot.editMessageText('💰 اختر رأس المال:', {chat_id:cid,message_id:mid,...capitalKB});
 
     // Mode
-    if (data === 'change_mode') {
-      return bot.editMessageText('⚙️ وضع التداول:', { chat_id: chatId, message_id: msgId, ...KB.modeMenu });
-    }
-    if (data === 'set_mode_PAPER') {
-      process.env.BOT_MODE = 'PAPER';
-      await db.updateSettings({ mode: 'PAPER' });
-      return bot.editMessageText('✅ الوضع التجريبي 📝', { chat_id: chatId, message_id: msgId });
-    }
-    if (data === 'set_mode_REAL') {
-      return bot.editMessageText('⚠️ <b>تحذير!</b> الوضع الحقيقي يستخدم أموالك!\nمتأكد؟',
-        { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...KB.confirmRealMode });
-    }
-    if (data === 'confirm_real_mode') {
-      process.env.BOT_MODE = 'REAL';
-      await db.updateSettings({ mode: 'REAL' });
-      return bot.editMessageText('✅ الوضع الحقيقي 💰 — ستُنفّذ الصفقات بأموال حقيقية!', { chat_id: chatId, message_id: msgId });
+    if (data.startsWith('mode_')) {
+      const m = data.slice(5);
+      process.env.BOT_MODE = m;
+      await db.updateSettings({mode:m});
+      return bot.editMessageText(`✅ الوضع: ${m==='PAPER'?'📝 تجريبي':m==='DEMO'?'🎮 ديمو':'💰 حقيقي'}`, {chat_id:cid,message_id:mid});
     }
 
-    // Profit protection
-    if (data === 'continue_trading') {
-      await _startBot(null, null, true);
-      return bot.editMessageText('▶️ استمر بحذر!', { chat_id: chatId, message_id: msgId });
+    // Suggestions
+    if (data.startsWith('sug_approve_')) {
+      const id = data.slice(12);
+      return approveSuggestion(bot, cid, mid, id);
     }
-    if (data === 'stop_trading') {
-      await _stopBot();
-      return bot.editMessageText('🔒 ربحك محمي ✅', { chat_id: chatId, message_id: msgId });
-    }
-
-    // Emergency
-    if (data === 'emergency_close') {
-      await bot.editMessageText('⏳ إغلاق الكل...', { chat_id: chatId, message_id: msgId });
-      return closeAll('EMERGENCY');
-    }
-    if (data === 'pause_bot') {
-      await _stopBot();
-      return bot.editMessageText('⏸️ متوقف مؤقتاً.', { chat_id: chatId, message_id: msgId });
-    }
-    if (data === 'confirm_stop') {
-      await _stopBot();
-      return bot.editMessageText('🛑 البوت توقف.', { chat_id: chatId, message_id: msgId });
+    if (data.startsWith('sug_reject_')) {
+      const id = data.slice(11);
+      await db.updateSuggestion(id,{status:'REJECTED',resolved_at:new Date().toISOString()});
+      return bot.editMessageText('❌ تم رفض الاقتراح.', {chat_id:cid,message_id:mid});
     }
 
-    // Stats
-    if (data.startsWith('stats_')) {
-      return showStatsPeriod(bot, chatId, msgId, data.slice(6));
-    }
-
-    // Cancel
-    if (data === 'cancel') {
-      clearState(chatId);
-      return bot.editMessageText('❌ تم الإلغاء.', { chat_id: chatId, message_id: msgId });
-    }
+    // Controls
+    if (data==='continue_trading') { await bot.editMessageText('▶️ استمر!', {chat_id:cid,message_id:mid}); }
+    if (data==='stop_trading')     { await _stop(); bot.editMessageText('🔒 موقوف.', {chat_id:cid,message_id:mid}); }
+    if (data==='emergency_close')  { await bot.editMessageText('⏳ إغلاق...', {chat_id:cid,message_id:mid}); await closeAll('EMERGENCY'); }
+    if (data==='pause_bot')        { await _stop(); bot.editMessageText('⏸️ متوقف مؤقتاً.', {chat_id:cid,message_id:mid}); }
+    if (data==='confirm_stop')     { await _stop(); bot.editMessageText('🛑 توقف.', {chat_id:cid,message_id:mid}); }
+    if (data==='refresh_dash')     { /* dashboard auto-refreshes */ }
+    if (data==='cancel')           { clearState(cid); bot.editMessageText('❌ إلغاء.', {chat_id:cid,message_id:mid}); }
   });
 
   // Commands
-  bot.onText(/\/stop$/,      async msg => bot.sendMessage(msg.chat.id, 'إيقاف البوت؟', KB.confirmStop));
-  bot.onText(/\/status/,     async msg => showStatus(bot, msg.chat.id));
-  bot.onText(/\/trades/,     async msg => showTrades(bot, msg.chat.id));
-  bot.onText(/\/stats/,      async msg => bot.sendMessage(msg.chat.id, '📊 الفترة:', KB.statsPeriodMenu));
-  bot.onText(/\/market/,     async msg => showMarket(bot, msg.chat.id));
-  bot.onText(/\/mode/,       async msg => showSettings(bot, msg.chat.id));
-  bot.onText(/\/close_all/,  async msg => bot.sendMessage(msg.chat.id, '⚠️ إغلاق طارئ:', KB.emergencyMenu));
-  bot.onText(/\/help/,       async msg => showHelp(bot, msg.chat.id));
-  bot.onText(/\/errors/,     async msg => showErrors(bot, msg.chat.id));
-  bot.onText(/\/performance/,async msg => showPerformance(bot, msg.chat.id));
+  bot.onText(/\/stop$/,      async m => bot.sendMessage(m.chat.id,'إيقاف؟',confirmStopKB));
+  bot.onText(/\/status/,     async m => showStatus(bot, m.chat.id));
+  bot.onText(/\/trades/,     async m => showTrades(bot, m.chat.id));
+  bot.onText(/\/stats/,      async m => showStats(bot, m.chat.id));
+  bot.onText(/\/suggestions/,async m => showSuggestions(bot, m.chat.id));
+  bot.onText(/\/close_all/,  async m => bot.sendMessage(m.chat.id,'⚠️ إغلاق طارئ:', emergencyKB));
+  bot.onText(/\/mode/,       async m => bot.sendMessage(m.chat.id,'⚙️ اختر الوضع:', modeKB));
+  bot.onText(/\/errors/,     async m => showErrors(bot, m.chat.id));
+  bot.onText(/\/balance/,    async m => showBalance(bot, m.chat.id));
+  bot.onText(/\/help/,       async m => showHelp(bot, m.chat.id));
 }
 
-// ─── FLOWS ────────────────────────────────────────────────────
-async function startDayFlow(bot, chatId) {
-  await bot.sendMessage(chatId,
-    '🌅 <b>بدء يوم تداول جديد</b>\n\nاختر رأس المال 👇',
-    { parse_mode: 'HTML', ...KB.startDayMenu });
+// ─── HANDLERS ────────────────────────────────────────────────
+function buildConfirmText(cap, stp) {
+  return `📋 <b>تأكيد</b>\n💰 $${cap}  🛑 ${stp}%=$${(cap*stp/100).toFixed(2)}\n📝 ${process.env.BOT_MODE||'PAPER'}\nتؤكد؟`;
 }
 
-async function showConfirm(bot, chatId, capital, stop) {
-  const stopAmt = (capital * stop / 100).toFixed(2);
-  await bot.sendMessage(chatId,
-`📋 <b>تأكيد الإعدادات</b>
-
-💰 رأس المال:  <b>$${capital}</b>
-🛑 Daily Stop: <b>${stop}%</b> = <b>$${stopAmt}</b>
-📝 الوضع:      <b>${process.env.BOT_MODE === 'REAL' ? 'حقيقي 💰' : 'تجريبي 📝'}</b>
-
-✅ هل تؤكد البدء؟`,
-    { parse_mode: 'HTML', ...KB.confirmStart(capital, stop) });
+async function showStartDay(bot, cid) {
+  await bot.sendMessage(cid,'🌅 <b>بدء يوم جديد</b>\n\nاختر رأس المال:', {parse_mode:'HTML',...capitalKB});
 }
 
-// ─── DISPLAY FUNCTIONS ────────────────────────────────────────
-async function showStatus(bot, chatId) {
-  const [session, open, sa] = await Promise.all([
-    db.getActiveSession(), db.getOpenTrades(), db.getDailyStats(1)
-  ]);
-  const stats = sa[0] || {};
-  const pnl = +(session?.net_pnl || 0);
-  await bot.sendMessage(chatId,
-`╔═══════════════════════╗
-║     📡 AXOM Status     ║
-╚═══════════════════════╝
+async function showStatus(bot, cid) {
+  const [session, open, sa] = await Promise.all([db.getActiveSession(), db.getOpenTrades(), db.getDailyStats(1)]);
+  const stats = sa[0]||{};
+  const pnl = +(session?.net_pnl||0);
+  await dash.send(`📡 <b>Status</b>
 
-${session ? '🟢 نشط' : '🔴 موقوف'}  •  ${process.env.BOT_MODE === 'REAL' ? '💰 حقيقي' : '📝 تجريبي'}
+${session?'🟢 نشط':'🔴 موقوف'}  ${process.env.BOT_MODE==='REAL'?'💰':'📝'}
 
-💰 رأس المال: <b>$${(+(session?.start_capital||0)).toFixed(2)}</b>
-📊 الرصيد:    <b>$${(+(session?.current_balance||0)).toFixed(4)}</b>
-📈 أعلى:      <b>$${(+(session?.daily_high||0)).toFixed(4)}</b>
-🛑 Stop:      <b>$${(+(session?.daily_stop_amount||0)).toFixed(2)}</b>
-📈 PnL اليوم: <b>${pnl>=0?'+':''}$${pnl.toFixed(4)}</b>
+💰 $${(+session?.start_capital||0).toFixed(2)}  →  $${(+session?.current_balance||0).toFixed(4)}
+PnL: ${pnl>=0?'+':''}$${pnl.toFixed(4)}  Stop: $${(+session?.daily_stop_amount||0).toFixed(2)}
 
-🔄 مفتوحة: <b>${open.length}</b>  📊 اليوم: <b>${stats.total_trades||0}</b>
-✅ Win Rate: <b>${stats.win_rate?.toFixed(1)||0}%</b>  💸 رسوم: <b>$${(+(stats.total_fees||0)).toFixed(4)}</b>`,
-    { parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: [[
-        { text: '🔄 تحديث', callback_data: 'refresh_status' },
-        { text: '🚨 طارئ', callback_data: 'emergency_close' }
-      ]]}
-    });
+🔄 ${open.length} مفتوحة  📊 ${stats.total_trades||0} اليوم  ✅ WR:${stats.win_rate?.toFixed(1)||0}%`,
+    { reply_markup:{ inline_keyboard:[[{ text:'🚨 طارئ', callback_data:'emergency_close' }]] }});
 }
 
-async function showTrades(bot, chatId) {
+async function showTrades(bot, cid) {
   const open = await db.getOpenTrades();
-  if (!open.length) return bot.sendMessage(chatId, '📭 لا توجد صفقات مفتوحة.', KB.mainMenu);
-  let text = `🔄 <b>الصفقات المفتوحة (${open.length})</b>\n\n`;
+  if (!open.length) return dash.send('📭 لا توجد صفقات مفتوحة.');
+  let txt = `🔄 <b>مفتوحة (${open.length})</b>\n\n`;
   for (const t of open) {
-    const ago = Math.round((Date.now() - new Date(t.opened_at).getTime()) / 60000);
-    text += `${t.direction==='LONG'?'🟢':'🔴'} <b>${t.symbol}</b> x${t.leverage} Score:${t.score}\n`;
-    text += `📍 $${(+t.entry_price).toFixed(2)}  🛑 $${(+t.stop_loss).toFixed(2)}\n`;
-    text += `${t.tp1_hit?'✅':'⬜'}TP1 ${t.tp2_hit?'✅':'⬜'}TP2 ⬜TP3  ${ago}د\n\n`;
+    const p   = MT.getPrice(t.symbol)||+t.entry_price;
+    const uPnl= t.direction==='LONG'?(p-t.entry_price)*(t.position_size||1):(t.entry_price-p)*(t.position_size||1);
+    const age = Math.round((Date.now()-new Date(t.opened_at).getTime())/60000);
+    txt += `${t.direction==='LONG'?'🟢':'🔴'} <b>${t.symbol}</b> x${t.leverage}\n`;
+    txt += `$${t.entry_price}→$${p.toFixed(2)} ${uPnl>=0?'📈+':'📉'}$${uPnl.toFixed(4)}\n`;
+    txt += `${t.tp1_hit?'✅':'⬜'}TP1 ${t.tp2_hit?'✅':'⬜'}TP2 ⬜TP3  ${age}د\n\n`;
   }
-  await bot.sendMessage(chatId, text, { parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '🚨 إغلاق الكل', callback_data: 'emergency_close' }]]}
-  });
+  await dash.send(txt, { reply_markup:{ inline_keyboard:[[{ text:'🚨 إغلاق الكل', callback_data:'emergency_close' }]] }});
 }
 
-async function showMarket(bot, chatId) {
-  const sigs = await db.getRecentSignals(8);
-  if (!sigs.length) return bot.sendMessage(chatId, '🔍 لا توجد إشارات حديثة.', KB.mainMenu);
-  let text = '📡 <b>آخر الإشارات</b>\n\n';
+async function showStats(bot, cid) {
+  const stats = await db.getDailyStats(7);
+  if (!stats.length) return dash.send('📊 لا توجد إحصائيات بعد.');
+  let tot={pnl:0,fees:0,t:0,w:0};
+  let txt='📊 <b>آخر 7 أيام</b>\n\n';
+  for (const s of stats) {
+    tot.pnl+=s.net_pnl||0; tot.fees+=s.total_fees||0; tot.t+=s.total_trades||0; tot.w+=s.winning_trades||0;
+    txt+=`${(s.net_pnl||0)>=0?'✅':'❌'} ${s.date}: ${(s.net_pnl||0)>=0?'+':''}$${(s.net_pnl||0).toFixed(2)} WR:${s.win_rate||0}% ${s.total_trades||0}ص\n`;
+  }
+  const wr=tot.t>0?((tot.w/tot.t)*100).toFixed(1):0;
+  txt+=`\n━━━━\n💰 $${tot.pnl.toFixed(4)}  💸 $${tot.fees.toFixed(4)}\n📊 ${tot.t}  ✅ ${wr}%`;
+  await dash.send(txt);
+}
+
+async function showSuggestions(bot, cid) {
+  const sug = await db.getPendingSuggestions();
+  if (!sug.length) return dash.send('💡 لا توجد اقتراحات معلقة حالياً.\nسيتم إرسال اقتراحات تلقائياً كل ساعة.');
+  for (const s of sug.slice(0,3)) {
+    await bot.sendMessage(cid,
+`💡 <b>اقتراح صفقة</b>
+
+${s.direction==='LONG'?'🟢 LONG':'🔴 SHORT'} <b>${s.symbol}</b>
+📊 Score: <b>${s.score}</b>  ⚡ x${s.leverage}
+${s.confidence==='HIGH'?'🔥':'⚠️'} ثقة: ${s.confidence}
+
+📍 Entry: $${(+s.entry_price).toFixed(4)}
+🛑 SL:    $${(+s.stop_loss).toFixed(4)}
+🎯 TP1:   $${(+s.tp1).toFixed(4)}
+🎯 TP2:   $${(+s.tp2).toFixed(4)}
+
+📝 ${s.summary}`,
+      { parse_mode:'HTML', ...suggestionKB(s.id) });
+  }
+}
+
+async function approveSuggestion(bot, cid, mid, id) {
+  const sug = (await db.getPendingSuggestions()).find(s=>s.id===id);
+  if (!sug) return bot.editMessageText('❌ انتهت صلاحية الاقتراح.', {chat_id:cid,message_id:mid});
+
+  const session = await db.getActiveSession();
+  if (!session) return bot.editMessageText('❌ لا توجد جلسة نشطة. ابدأ يوم أولاً.', {chat_id:cid,message_id:mid});
+
+  try {
+    const { openTrade, CompoundState } = require('../trading/executor');
+    // Create minimal compound state for risk calc
+    const cs = new CompoundState(session.start_capital, session.daily_stop_amount);
+    const signal = { ...sug, direction: sug.direction, entry: sug.entry_price, sl: sug.stop_loss, kz:{ zone:'MANUAL' } };
+    await openTrade(signal, session, cs);
+    await db.updateSuggestion(id,{status:'APPROVED',resolved_at:new Date().toISOString()});
+    await bot.editMessageText('✅ تم تنفيذ الصفقة!', {chat_id:cid,message_id:mid});
+  } catch (e) {
+    await bot.editMessageText(`❌ فشل التنفيذ: ${e.message}`, {chat_id:cid,message_id:mid});
+  }
+}
+
+async function showMarket(bot, cid) {
+  const sigs = await db.getRecentSignals(6);
+  if (!sigs.length) return dash.send('🔍 لا توجد إشارات حديثة.');
+  let txt='📡 <b>آخر الإشارات</b>\n\n';
   for (const s of sigs) {
-    const ago = Math.round((Date.now() - new Date(s.created_at).getTime()) / 60000);
-    text += `${s.decision==='APPROVE'?'🟢':'🔴'} <b>${s.symbol}</b> Score:${s.total_score} ${ago}د\n`;
-    text += s.decision==='APPROVE'
-      ? `   ${s.direction} TP1:$${s.tp1?.toFixed(2)||'?'} x${s.leverage}\n\n`
-      : `   ❌ ${(s.reject_reason||'').substring(0,35)}\n\n`;
+    const ago=Math.round((Date.now()-new Date(s.created_at).getTime())/60000);
+    txt+=`${s.decision==='APPROVE'?'🟢':'🔴'} <b>${s.symbol}</b> Score:${s.total_score} ${ago}د\n`;
+    txt+=s.decision==='APPROVE'?`   ${s.direction} TP1:$${s.tp1?.toFixed(2)||'?'}\n\n`:`   ❌ ${(s.reject_reason||'').slice(0,35)}\n\n`;
   }
-  await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
+  await dash.send(txt);
 }
 
-async function showPerformance(bot, chatId) {
-  const week = await db.getWeeklyStats();
-  if (!week.length) return bot.sendMessage(chatId, '📈 لا توجد بيانات كافية.', KB.mainMenu);
-  const tot = week.reduce((a,s)=>({ pnl:a.pnl+(s.net_pnl||0), fees:a.fees+(s.total_fees||0), t:a.t+(s.total_trades||0), w:a.w+(s.winning_trades||0) }), {pnl:0,fees:0,t:0,w:0});
-  const wr = tot.t > 0 ? ((tot.w/tot.t)*100).toFixed(1) : 0;
-  await bot.sendMessage(chatId,
-`📈 <b>تقرير الأسبوع</b>
-
-💰 صافي: <b>${tot.pnl>=0?'+':''}$${tot.pnl.toFixed(4)}</b>
-💸 رسوم: <b>$${tot.fees.toFixed(4)}</b>
-📊 صفقات: <b>${tot.t}</b>  ✅ WR: <b>${wr}%</b>
-📅 أيام: <b>${week.length}</b>
-💹 متوسط/يوم: <b>$${week.length>0?(tot.pnl/week.length).toFixed(4):0}</b>`,
-    { parse_mode: 'HTML' });
+async function showSettings(bot, cid) {
+  const bal = await bingx.getBalance().catch(()=>null);
+  await bot.sendMessage(cid,`⚙️ <b>إعدادات</b>
+الوضع: ${process.env.BOT_MODE==='REAL'?'💰 حقيقي':process.env.BOT_MODE==='DEMO'?'🎮 ديمو':'📝 تجريبي'}
+${bal?`رصيد: $${bal.balance.toFixed(4)}`:''}`, {parse_mode:'HTML',...modeKB});
 }
 
-async function showSettings(bot, chatId) {
-  await bot.sendMessage(chatId,
-    `⚙️ <b>الإعدادات</b>\nالوضع: ${process.env.BOT_MODE==='REAL'?'💰 حقيقي':'📝 تجريبي'}`,
-    { parse_mode: 'HTML', ...KB.settingsMenu });
+async function showBalance(bot, cid) {
+  try {
+    const bal = await bingx.getBalance();
+    await dash.send(`💰 <b>الرصيد</b>
+وضع: ${bal.mode}
+رصيد: <b>$${bal.balance.toFixed(4)}</b>
+متاح: <b>$${bal.available.toFixed(4)}</b>`);
+  } catch (e) {
+    await dash.send(`❌ فشل جلب الرصيد: ${e.message}`);
+  }
 }
 
-async function showHelp(bot, chatId) {
-  await bot.sendMessage(chatId,
-`📖 <b>دليل AXOM</b>
+async function showErrors(bot, cid) {
+  const errs = await db.getUnresolvedErrors();
+  if (!errs.length) return dash.send('✅ لا أخطاء نشطة.');
+  let txt=`🚨 <b>أخطاء (${errs.length})</b>\n\n`;
+  for (const e of errs.slice(0,5)) txt+=`🔴 <b>${e.source}</b>: ${e.message}\n${new Date(e.timestamp).toLocaleTimeString('ar-SA')}\n\n`;
+  await dash.send(txt);
+}
+
+async function showHelp(bot, cid) {
+  await dash.send(`📖 <b>AXOM دليل</b>
 
 <b>القائمة:</b>
-🚀 بدء يوم جديد
-📡 الحالة  •  🔄 الصفقات
-📊 الإحصائيات  •  🔍 فرص السوق
-📈 الأداء  •  ⚙️ الإعدادات
+🚀 بدء يوم  •  📡 الحالة
+🔄 صفقات   •  📊 إحصائيات
+💡 اقتراحات •  🔍 فرص السوق
+⚙️ إعدادات  •  🆘 مساعدة
 
 <b>أوامر:</b>
-/stop — إيقاف  •  /close_all — طارئ
-/errors — الأخطاء  •  /performance — تقرير
+/balance — رصيد الحساب
+/errors — الأخطاء النشطة
+/close_all — إغلاق طارئ
+/mode — تغيير وضع التداول
 
-💬 اكتب أي سؤال وسأجيبك!`,
-    { parse_mode: 'HTML', ...KB.mainMenu });
+💬 اكتب أي سؤال بالعربية!`, mainMenu);
 }
 
-async function showErrors(bot, chatId) {
-  const errs = await db.getUnresolvedErrors();
-  if (!errs.length) return bot.sendMessage(chatId, '✅ لا توجد أخطاء نشطة.', KB.mainMenu);
-  let text = `🚨 <b>أخطاء (${errs.length})</b>\n\n`;
-  for (const e of errs.slice(0,5)) {
-    text += `🔴 <b>${e.source}</b>: ${e.message}\n⏰ ${new Date(e.timestamp).toLocaleTimeString('ar-SA')}\n\n`;
-  }
-  await bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-}
-
-async function showStatsPeriod(bot, chatId, msgId, period) {
-  const daysMap = { today:1, week:7, month:30, all:365 };
-  const labelMap = { today:'اليوم', week:'أسبوع', month:'شهر', all:'كل الوقت' };
-  const days  = daysMap[period]  || 7;
-  const label = labelMap[period] || 'أسبوع';
-  const stats = await db.getDailyStats(days);
-  if (!stats.length) return bot.editMessageText('📊 لا توجد بيانات.', { chat_id: chatId, message_id: msgId });
-
-  let totalPnl=0, totalT=0, totalW=0, totalF=0;
-  let text = `📊 <b>الإحصائيات — ${label}</b>\n\n`;
-  for (const s of stats.slice(0,7)) {
-    totalPnl+=s.net_pnl||0; totalT+=s.total_trades||0; totalW+=s.winning_trades||0; totalF+=s.total_fees||0;
-    text += `${(s.net_pnl||0)>=0?'✅':'❌'} ${s.date}: ${(s.net_pnl||0)>=0?'+':''}$${(s.net_pnl||0).toFixed(2)} WR:${s.win_rate||0}% ${s.total_trades||0}ص\n`;
-  }
-  const wr = totalT>0?((totalW/totalT)*100).toFixed(1):0;
-  text += `\n━━━━━━━━━━━━\n💰 صافي: <b>${totalPnl>=0?'+':''}$${totalPnl.toFixed(4)}</b>\n💸 رسوم: <b>$${totalF.toFixed(4)}</b>\n📊 ${totalT} صفقة  ✅ WR: <b>${wr}%</b>`;
-  await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML' });
-}
-
-async function chatAI(bot, chatId, text) {
+async function handleChat(bot, cid, text) {
   try {
-    const [session, open, sa] = await Promise.all([db.getActiveSession(), db.getOpenTrades(), db.getDailyStats(1)]);
+    const [session,open,sa] = await Promise.all([db.getActiveSession(),db.getOpenTrades(),db.getDailyStats(1)]);
     const ctx = { running:!!session, mode:process.env.BOT_MODE, balance:session?.current_balance, openTrades:open.length, todayPnL:sa[0]?.net_pnl||0, winRate:sa[0]?.win_rate||0 };
-    await db.saveChatMessage('USER', text);
-    const reply = await G.chatReply(text, ctx);
-    await db.saveChatMessage('BOT', reply);
-    await bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
-  } catch { await bot.sendMessage(chatId, 'عذراً، خطأ مؤقت.'); }
+    await db.saveChat('USER', text);
+    const gemini = require('../core/gemini');
+    const reply  = await gemini.chatReply(text, ctx);
+    await db.saveChat('BOT', reply);
+    await dash.send(reply);
+  } catch { await dash.send('عذراً، خطأ مؤقت.'); }
 }
 
-module.exports = { register };
+module.exports = { register, suggestionKB };
