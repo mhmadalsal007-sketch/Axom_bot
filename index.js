@@ -434,6 +434,7 @@ async function main() {
 }
 
 // Expose scanMode control
-global.setScanMode = m => { appState.scanMode = m; };
+global.setScanMode      = m => { appState.scanMode = m; };
+global.getCurrentScanMode = () => appState.scanMode;
 
 main();
