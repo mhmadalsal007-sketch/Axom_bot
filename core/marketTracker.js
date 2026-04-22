@@ -1,139 +1,117 @@
 // ============================================================
-// AXOM — Live Market Tracker
-// Tracks real-time prices, OI, funding, liquidations
+// AXOM — MarketTracker
+// Single source of truth for all live market data
 // ============================================================
 
 class MarketTracker {
   constructor() {
-    this.prices = {};          // symbol → price
-    this.prevPrices = {};      // for % change calc
-    this.oiData = {};          // symbol → { current, prev, change }
-    this.fundingData = {};     // symbol → rate
-    this.liquidations = {};    // symbol → USD in last hour
-    this.liqTimestamps = {};   // symbol → [{ time, value }]
-    this.volumeData = {};      // symbol → { current, avg }
-    this.priceHistory = {};    // symbol → last 10 prices (for flash crash)
-    this.lastOIUpdate = {};    // symbol → timestamp
+    this.prices     = {};   // symbol → price
+    this.prevPrices = {};
+    this.oiData     = {};   // symbol → {oi, prevOI, change1h}
+    this.funding    = {};   // symbol → rate
+    this.liq1h      = {};   // symbol → USD in last hour
+    this._liqLog    = {};   // symbol → [{ts, val}]
+    this.volRatio   = {};   // symbol → ratio vs avg
+    this.priceHist  = {};   // symbol → [{price, ts}] last 30 ticks
+    this.updatedAt  = {};   // symbol → timestamp
   }
 
-  // ─── PRICE ────────────────────────────────────────────────
-  updatePrice(symbol, price) {
+  // ─── PRICE ──────────────────────────────────────────────────
+  setPrice(symbol, price) {
     this.prevPrices[symbol] = this.prices[symbol] || price;
-    this.prices[symbol] = price;
+    this.prices[symbol]     = price;
+    this.updatedAt[symbol]  = Date.now();
 
-    // Track price history for flash crash detection
-    if (!this.priceHistory[symbol]) this.priceHistory[symbol] = [];
-    this.priceHistory[symbol].push({ price, time: Date.now() });
-    if (this.priceHistory[symbol].length > 20) this.priceHistory[symbol].shift();
+    if (!this.priceHist[symbol]) this.priceHist[symbol] = [];
+    this.priceHist[symbol].push({ price, ts: Date.now() });
+    if (this.priceHist[symbol].length > 30) this.priceHist[symbol].shift();
   }
 
-  getPrice(symbol) { return this.prices[symbol] || null; }
+  getPrice(symbol)    { return this.prices[symbol] || null; }
+  getAllPrices()       { return { ...this.prices }; }
 
   getPriceChange(symbol) {
-    const cur = this.prices[symbol];
-    const prev = this.prevPrices[symbol];
-    if (!cur || !prev) return 0;
-    return ((cur - prev) / prev) * 100;
+    const c = this.prices[symbol], p = this.prevPrices[symbol];
+    if (!c || !p) return 0;
+    return ((c - p) / p) * 100;
   }
 
-  // Flash crash: price moved > 1.5% in last 10 seconds
-  isFlashCrash(symbol) {
-    const hist = this.priceHistory[symbol];
+  isFlashCrash(symbol, thresholdPct = 1.5) {
+    const hist = this.priceHist[symbol];
     if (!hist || hist.length < 2) return false;
-    const now = Date.now();
-    const recent = hist.filter(h => now - h.time < 10000);
+    const now    = Date.now();
+    const recent = hist.filter(h => now - h.ts < 10000);
     if (recent.length < 2) return false;
-    const oldest = recent[0].price;
-    const newest = recent[recent.length - 1].price;
-    return Math.abs((newest - oldest) / oldest) * 100 > 1.5;
+    const chg = Math.abs((recent.at(-1).price - recent[0].price) / recent[0].price) * 100;
+    return chg > thresholdPct;
   }
 
-  // ─── OI ───────────────────────────────────────────────────
-  updateOI(symbol, currentOI) {
-    const prev = this.oiData[symbol]?.current || currentOI;
-    const change = prev > 0 ? ((currentOI - prev) / prev) * 100 : 0;
-    this.oiData[symbol] = { current: currentOI, prev, change, updatedAt: Date.now() };
+  // ─── OI ─────────────────────────────────────────────────────
+  setOI(symbol, oi) {
+    const prev = this.oiData[symbol]?.oi || oi;
+    const chg  = prev > 0 ? ((oi - prev) / prev) * 100 : 0;
+    this.oiData[symbol] = { oi, prevOI: prev, change1h: parseFloat(chg.toFixed(3)) };
+  }
+  getOIChange(symbol) { return this.oiData[symbol]?.change1h || 0; }
+  getOI(symbol)       { return this.oiData[symbol]?.oi || 0; }
+
+  // ─── FUNDING ────────────────────────────────────────────────
+  setFunding(symbol, rate) { this.funding[symbol] = rate; }
+  getFunding(symbol)       { return this.funding[symbol] || 0; }
+  isFundingDangerous(symbol, dir) {
+    const r = this.getFunding(symbol);
+    return dir === 'LONG' ? r > 0.001 : r < -0.0008;
   }
 
-  getOIChange(symbol) { return this.oiData[symbol]?.change || 0; }
-  getOI(symbol) { return this.oiData[symbol]?.current || 0; }
-
-  // ─── FUNDING ──────────────────────────────────────────────
-  updateFunding(symbol, rate) { this.fundingData[symbol] = { rate, updatedAt: Date.now() }; }
-  getFunding(symbol) { return this.fundingData[symbol]?.rate || 0; }
-
-  isFundingDangerous(symbol, direction) {
-    const rate = this.getFunding(symbol);
-    if (direction === 'LONG' && rate > 0.001) return true;
-    if (direction === 'SHORT' && rate < -0.0008) return true;
-    return false;
-  }
-
-  // ─── LIQUIDATIONS ─────────────────────────────────────────
+  // ─── LIQUIDATIONS ───────────────────────────────────────────
   addLiquidation(symbol, value) {
-    if (!this.liquidations[symbol]) this.liquidations[symbol] = 0;
-    if (!this.liqTimestamps[symbol]) this.liqTimestamps[symbol] = [];
-
-    this.liquidations[symbol] += value;
-    this.liqTimestamps[symbol].push({ time: Date.now(), value });
-
-    // Cleanup old liquidations (> 1 hour)
-    const oneHourAgo = Date.now() - 3600000;
-    this.liqTimestamps[symbol] = this.liqTimestamps[symbol].filter(l => l.time > oneHourAgo);
-    this.liquidations[symbol] = this.liqTimestamps[symbol].reduce((s, l) => s + l.value, 0);
+    if (!this._liqLog[symbol]) this._liqLog[symbol] = [];
+    this._liqLog[symbol].push({ ts: Date.now(), val: value });
+    const cutoff = Date.now() - 3600000;
+    this._liqLog[symbol] = this._liqLog[symbol].filter(l => l.ts > cutoff);
+    this.liq1h[symbol]   = this._liqLog[symbol].reduce((s,l) => s + l.val, 0);
   }
+  getLiq1h(symbol) { return this.liq1h[symbol] || 0; }
 
-  getLiquidations1h(symbol) { return this.liquidations[symbol] || 0; }
+  // ─── VOLUME ─────────────────────────────────────────────────
+  setVolRatio(symbol, ratio) { this.volRatio[symbol] = ratio; }
+  getVolRatio(symbol)        { return this.volRatio[symbol] || 1; }
 
-  // ─── VOLUME ───────────────────────────────────────────────
-  updateVolume(symbol, current, avg) {
-    this.volumeData[symbol] = { current, avg, ratio: avg > 0 ? current / avg : 1 };
-  }
-
-  getVolumeRatio(symbol) { return this.volumeData[symbol]?.ratio || 1; }
-
-  // ─── SNAPSHOT for analysis ────────────────────────────────
+  // ─── SNAPSHOT ───────────────────────────────────────────────
   getSnapshot(symbol) {
     return {
       symbol,
-      price: this.prices[symbol] || 0,
-      priceChange: this.getPriceChange(symbol),
-      oi: this.getOI(symbol),
-      oiChange: this.getOIChange(symbol),
-      funding: this.getFunding(symbol),
-      liq1h: this.getLiquidations1h(symbol),
-      volRatio: this.getVolumeRatio(symbol),
+      price:      this.prices[symbol] || 0,
+      priceChg:   this.getPriceChange(symbol),
+      oi:         this.getOI(symbol),
+      oiChg1h:    this.getOIChange(symbol),
+      funding:    this.getFunding(symbol),
+      liq1h:      this.getLiq1h(symbol),
+      volRatio:   this.getVolRatio(symbol),
       flashCrash: this.isFlashCrash(symbol),
-      timestamp: new Date().toISOString()
+      stale:      Date.now() - (this.updatedAt[symbol] || 0) > 10000
     };
   }
 
-  // ─── ALL PRICES ───────────────────────────────────────────
-  getAllPrices() { return { ...this.prices }; }
+  // ─── TOP MOVERS ─────────────────────────────────────────────
+  getTopByOI(n = 5) {
+    return Object.keys(this.oiData)
+      .map(s => ({ symbol: s, oiChg: Math.abs(this.getOIChange(s)) }))
+      .sort((a,b) => b.oiChg - a.oiChg)
+      .slice(0, n);
+  }
 
-  // ─── MARKET SUMMARY ───────────────────────────────────────
   getSummary() {
-    const symbols = Object.keys(this.prices);
-    const topMovers = symbols
-      .map(s => ({ symbol: s, change: this.getPriceChange(s) }))
-      .sort((a, b) => Math.abs(b.change) - Math.abs(a.change))
-      .slice(0, 5);
-
-    const highLiquidations = symbols
-      .filter(s => this.getLiquidations1h(s) > 500000)
-      .map(s => ({ symbol: s, liq: this.getLiquidations1h(s) }))
-      .sort((a, b) => b.liq - a.liq)
-      .slice(0, 3);
-
+    const syms = Object.keys(this.prices);
     return {
-      trackedSymbols: symbols.length,
-      topMovers,
-      highLiquidations,
-      timestamp: new Date().toISOString()
+      tracked: syms.length,
+      topMovers: syms.map(s => ({ symbol:s, chg: this.getPriceChange(s) }))
+        .sort((a,b) => Math.abs(b.chg)-Math.abs(a.chg)).slice(0,3),
+      highLiq: syms.filter(s => this.getLiq1h(s) > 1000000)
+        .map(s => ({ symbol:s, liq: this.getLiq1h(s) }))
+        .sort((a,b) => b.liq-a.liq).slice(0,3)
     };
   }
 }
 
-// Singleton
-const tracker = new MarketTracker();
-module.exports = tracker;
+module.exports = new MarketTracker();
