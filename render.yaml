@@ -3,6 +3,7 @@ services:
     name: axom-bot
     runtime: node
     plan: free
+    rootDir: .
     buildCommand: npm install
     startCommand: node index.js
     healthCheckPath: /health
