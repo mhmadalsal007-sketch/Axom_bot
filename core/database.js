@@ -1,235 +1,157 @@
-// ============================================================
-// AXOM — Live Dashboard
-// Edits ONE Telegram message every 1.5s (throttled)
-// Shows: price, top3 candidates, open trades, balance
-// ============================================================
-const TelegramBot = require('node-telegram-bot-api');
-const MT  = require('../core/marketTracker');
-const logger = require('../utils/logger');
+const { createClient } = require('@supabase/supabase-js');
 
-let bot          = null;
-let dashMsgId    = null;  // the single dashboard message id
-let chatId       = null;
-let lastEdit     = 0;
-const THROTTLE   = 1500;  // 1.5 seconds
-let dashTimer    = null;
-let stateRef     = null;  // reference to app state
+const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-function init(botInstance, cid) {
-  bot    = botInstance;
-  chatId = cid || process.env.TELEGRAM_CHAT_ID;
+// ─── SETTINGS ─────────────────────────────────────────────────
+async function getSettings() {
+  const { data,error } = await sb.from('settings').select('*').eq('user_id','default').single();
+  if (error) throw new Error(`DB settings: ${error.message}`);
+  return data;
+}
+async function updateSettings(u) {
+  const { data,error } = await sb.from('settings').update({...u,updated_at:new Date().toISOString()}).eq('user_id','default').select().single();
+  if (error) throw new Error(`DB updateSettings: ${error.message}`);
+  return data;
 }
 
-function setStateRef(ref) { stateRef = ref; }
-
-// ─── BUILD DASHBOARD TEXT ─────────────────────────────────────
-function buildDashboard() {
-  if (!stateRef) return '⏳ جارٍ التهيئة...';
-
-  const { session, openTrades, top3, running, compound, wss } = stateRef;
-  const mode  = process.env.BOT_MODE || 'PAPER';
-  const now   = new Date().toLocaleTimeString('ar-SA');
-  const wsStat = wss?.isMarketConnected() ? '🟢' : '🔴';
-  const accStat = wss?.isAccountConnected() ? '🟢' : '🔴';
-
-  let txt = `╔══════════════════════════╗
-║  🤖 <b>AXOM Live Dashboard</b>   ║
-╚══════════════════════════╝
-⏰ ${now}  ${running?'🟢 نشط':'🔴 موقوف'}  ${mode==='PAPER'?'📝':'mode==='DEMO'?'🎮':'💰'}
-📡 Market:${wsStat}  Account:${accStat}
-
-`;
-
-  // Balance
-  if (session) {
-    const pnl = +(session.net_pnl||0);
-    const pnlIcon = pnl>0?'📈':pnl<0?'📉':'➡️';
-    txt += `💰 <b>رأس المال:</b> $${(+session.start_capital).toFixed(2)}
-📊 <b>الرصيد:</b>    $${(+session.current_balance).toFixed(4)}
-📈 <b>أعلى:</b>     $${(+session.daily_high).toFixed(4)}
-🛑 <b>Stop:</b>     $${(+session.daily_stop_amount).toFixed(2)}
-${pnlIcon} <b>PnL:</b>      ${pnl>=0?'+':''}$${pnl.toFixed(4)}\n`;
-
-    if (compound) {
-      txt += `🪜 Ladder: x${compound.ladderMultiplier}  🎯 Streak: ${compound.consecutiveWins}\n`;
-    }
-  } else {
-    txt += `💤 <i>انتظر /start_day لبدء اليوم</i>\n`;
-  }
-
-  txt += '\n';
-
-  // Top 3 candidates
-  if (top3?.length) {
-    txt += `━━━━━━━━━━━━━━━━━━━━━━\n`;
-    txt += `🔍 <b>أفضل 3 مرشحين:</b>\n`;
-    top3.forEach((t,i) => {
-      const rankIcon = i===0?'🥇':i===1?'🥈':'🥉';
-      const dirIcon  = t.direction==='LONG'?'🟢':'🔴';
-      const price    = MT.getPrice(t.symbol);
-      txt += `${rankIcon} <b>${t.symbol}</b> ${dirIcon}${t.direction||'?'} Score:<b>${t.score}</b>`;
-      if (price) txt += ` $${price.toFixed(2)}`;
-      txt += `\n   ${t.summary||t.reject_reason||''}\n`;
-    });
-    txt += '\n';
-  }
-
-  // Open trades
-  if (openTrades?.length) {
-    txt += `━━━━━━━━━━━━━━━━━━━━━━\n`;
-    txt += `🔄 <b>صفقات مفتوحة (${openTrades.length}):</b>\n`;
-    openTrades.forEach(t => {
-      const curPrice = MT.getPrice(t.symbol) || t.entry_price;
-      const isLong   = t.direction === 'LONG';
-      const uPnl     = isLong
-        ? (curPrice - t.entry_price) * (t.position_size||1)
-        : (t.entry_price - curPrice) * (t.position_size||1);
-      const uIcon    = uPnl>=0?'📈':'📉';
-      txt += `${t.direction==='LONG'?'🟢':'🔴'} <b>${t.symbol}</b> x${t.leverage} Score:${t.score}\n`;
-      txt += `   📍$${t.entry_price}  ${uIcon}${uPnl>=0?'+':''}$${uPnl.toFixed(4)}\n`;
-      txt += `   ${t.tp1_hit?'✅':'⬜'}TP1 ${t.tp2_hit?'✅':'⬜'}TP2 ⬜TP3\n`;
-    });
-  }
-
-  return txt;
+// ─── SESSIONS ─────────────────────────────────────────────────
+async function createSession(capital, stopPct, mode) {
+  const today = new Date().toISOString().split('T')[0];
+  await sb.from('daily_sessions').delete().eq('date',today);
+  const { data,error } = await sb.from('daily_sessions').insert({
+    date:today, start_capital:capital,
+    daily_stop_amount:parseFloat((capital*stopPct/100).toFixed(4)),
+    current_balance:capital, daily_high:capital,
+    status:'ACTIVE', mode:mode||'PAPER',
+    permission_given_at:new Date().toISOString()
+  }).select().single();
+  if (error) throw new Error(`DB createSession: ${error.message}`);
+  return data;
+}
+async function getActiveSession() {
+  const today = new Date().toISOString().split('T')[0];
+  const { data } = await sb.from('daily_sessions').select('*').eq('date',today).eq('status','ACTIVE').single();
+  return data||null;
+}
+async function updateSession(id,u) {
+  const { data,error } = await sb.from('daily_sessions').update(u).eq('id',id).select().single();
+  if (error) throw new Error(`DB updateSession: ${error.message}`);
+  return data;
+}
+async function getTodaySession() {
+  const today = new Date().toISOString().split('T')[0];
+  const { data } = await sb.from('daily_sessions').select('*').eq('date',today).single();
+  return data||null;
 }
 
-// ─── UPDATE DASHBOARD (throttled) ─────────────────────────────
-async function update() {
-  if (!bot || !chatId) return;
-  const now = Date.now();
-  if (now - lastEdit < THROTTLE) return;
-  lastEdit = now;
-
-  const text = buildDashboard();
-  try {
-    if (!dashMsgId) {
-      const msg = await bot.sendMessage(chatId, text, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[
-          { text:'🔄 تحديث', callback_data:'refresh_dash' },
-          { text:'🚨 طارئ',  callback_data:'emergency_close' }
-        ]]}
-      });
-      dashMsgId = msg.message_id;
-    } else {
-      await bot.editMessageText(text, {
-        chat_id: chatId, message_id: dashMsgId,
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[
-          { text:'🔄 تحديث', callback_data:'refresh_dash' },
-          { text:'🚨 طارئ',  callback_data:'emergency_close' }
-        ]]}
-      });
-    }
-  } catch (e) {
-    if (e.message?.includes('message is not modified')) return;
-    if (e.message?.includes('message to edit not found')) { dashMsgId = null; return; }
-    logger.warn('DASHBOARD', e.message);
-  }
+// ─── TRADES ──────────────────────────────────────────────────
+async function saveTrade(t) {
+  const { data,error } = await sb.from('trades').insert(t).select().single();
+  if (error) throw new Error(`DB saveTrade: ${error.message}`);
+  return data;
+}
+async function updateTrade(id,u) {
+  const { data,error } = await sb.from('trades').update(u).eq('id',id).select().single();
+  if (error) throw new Error(`DB updateTrade: ${error.message}`);
+  return data;
+}
+async function getOpenTrades() {
+  const { data,error } = await sb.from('trades').select('*').eq('status','OPEN');
+  if (error) throw new Error(`DB getOpenTrades: ${error.message}`);
+  return data||[];
+}
+async function getTodayTrades() {
+  const today = new Date().toISOString().split('T')[0];
+  const { data } = await sb.from('trades').select('*').gte('opened_at',today).order('opened_at',{ascending:false});
+  return data||[];
+}
+async function getRecentTrades(n=10) {
+  const { data } = await sb.from('trades').select('*').eq('status','CLOSED').order('closed_at',{ascending:false}).limit(n);
+  return data||[];
 }
 
-function startLiveDashboard() {
-  if (dashTimer) clearInterval(dashTimer);
-  dashTimer = setInterval(update, THROTTLE);
-  logger.info('DASHBOARD', 'Live dashboard started (1.5s interval)');
+// ─── SIGNALS ─────────────────────────────────────────────────
+async function saveSignal(s) {
+  const { data,error } = await sb.from('signals').insert(s).select().single();
+  if (error) console.error(`DB saveSignal: ${error.message}`);
+  return data;
+}
+async function getRecentSignals(n=20) {
+  const { data } = await sb.from('signals').select('*').order('created_at',{ascending:false}).limit(n);
+  return data||[];
 }
 
-function stopLiveDashboard() {
-  if (dashTimer) { clearInterval(dashTimer); dashTimer = null; }
+// ─── SUGGESTIONS (manual proposals) ─────────────────────────
+async function saveSuggestion(s) {
+  const { data,error } = await sb.from('suggestions').insert(s).select().single();
+  if (error) console.error(`DB saveSuggestion: ${error.message}`);
+  return data;
+}
+async function getPendingSuggestions() {
+  const { data } = await sb.from('suggestions').select('*').eq('status','PENDING').order('score',{ascending:false});
+  return data||[];
+}
+async function updateSuggestion(id,u) {
+  await sb.from('suggestions').update(u).eq('id',id);
 }
 
-function resetDashMsg() { dashMsgId = null; }
-
-// ─── ONE-OFF MESSAGES ─────────────────────────────────────────
-async function send(text, opts = {}) {
-  if (!bot || !chatId) return null;
-  try { return await bot.sendMessage(chatId, text, { parse_mode:'HTML', ...opts }); }
-  catch (e) { logger.warn('TG', `send: ${e.message}`); return null; }
+// ─── STATS ───────────────────────────────────────────────────
+async function upsertStats(s) {
+  const today = new Date().toISOString().split('T')[0];
+  const { error } = await sb.from('daily_stats').upsert({...s,date:today},{onConflict:'date'});
+  if (error) console.error(`DB upsertStats: ${error.message}`);
+}
+async function getDailyStats(n=7) {
+  const { data } = await sb.from('daily_stats').select('*').order('date',{ascending:false}).limit(n);
+  return data||[];
+}
+async function getWeeklyStats() {
+  const d = new Date(Date.now()-7*86400000).toISOString().split('T')[0];
+  const { data } = await sb.from('daily_stats').select('*').gte('date',d).order('date',{ascending:true});
+  return data||[];
 }
 
-async function sendTradeOpen(t) {
-  await send(`╔══════════════════╗
-║  🎯 صفقة جديدة   ║
-╚══════════════════╝
-
-${t.direction==='LONG'?'🟢 LONG':'🔴 SHORT'} <b>${t.symbol}</b>
-📊 Score: <b>${t.score}</b>  ⚡ x${t.leverage}
-🕐 ${t.kill_zone||'OFF'}
-
-📍 Entry:  <b>$${(+t.entry_price).toFixed(4)}</b>
-🛑 SL:     <b>$${(+t.stop_loss).toFixed(4)}</b>
-🎯 TP1:    <b>$${(+t.tp1).toFixed(4)}</b>
-🎯 TP2:    <b>$${(+t.tp2).toFixed(4)}</b>
-🎯 TP3:    Trailing 0.3%
-
-💰 Risk: <b>$${(+t.risk_amount).toFixed(2)}</b>
-💸 Fee:  <b>$${(+(t.fee_open||0)).toFixed(4)}</b>`);
+// ─── LOGS ────────────────────────────────────────────────────
+async function saveLog(level,category,message,details=null) {
+  const { error } = await sb.from('bot_logs').insert({level,category,message,details});
+  if (error) console.error(`DB saveLog: ${error.message}`);
+}
+async function getRecentLogs(n=20) {
+  const { data } = await sb.from('bot_logs').select('*').order('timestamp',{ascending:false}).limit(n);
+  return data||[];
 }
 
-async function sendTP(t, num, pnl, fee) {
-  await send(`✅ <b>TP${num} محقق!</b>  ${t.symbol}
-💰 +$${pnl.toFixed(4)}  💸 fee:$${fee.toFixed(4)}
-📈 صافي: +$${(pnl-fee).toFixed(4)}
-🔒 SL → ${num===1?'Entry':'TP'+( num-1)}`);
+// ─── ERRORS ──────────────────────────────────────────────────
+async function saveError(type,source,message,details=null) {
+  const { error } = await sb.from('error_alerts').insert({type,source,message,details});
+  if (error) console.error(`DB saveError: ${error.message}`);
+}
+async function getUnresolvedErrors(n=5) {
+  const { data } = await sb.from('error_alerts').select('*').eq('is_resolved',false).order('timestamp',{ascending:false}).limit(n);
+  return data||[];
+}
+async function resolveError(id) {
+  await sb.from('error_alerts').update({is_resolved:true,resolved_at:new Date().toISOString()}).eq('id',id);
 }
 
-async function sendClose(t) {
-  const win = (t.pnl_after_fees||0) > 0;
-  await send(`${win?'🏆':'❌'} <b>صفقة مغلقة</b>  ${t.symbol}
-💰 PnL: ${win?'+':''}$${(+(t.pnl||0)).toFixed(4)}
-💸 رسوم: $${(+(t.total_fees||0)).toFixed(4)}
-📈 صافي: ${win?'+':''}$${(+(t.pnl_after_fees||0)).toFixed(4)}
-${t.tp1_hit?'✅':'⬜'}TP1 ${t.tp2_hit?'✅':'⬜'}TP2 ${t.tp3_hit?'✅':'⬜'}TP3
-📝 ${t.close_reason}`);
+// ─── CHAT ────────────────────────────────────────────────────
+async function saveChat(role,message,ctx=null) {
+  const { error } = await sb.from('chat_history').insert({role,message,context_data:ctx});
+  if (error) console.error(`DB saveChat: ${error.message}`);
 }
-
-async function sendDailyReport(session, stats) {
-  const wr = stats?.total_trades>0 ? ((stats.winning_trades/stats.total_trades)*100).toFixed(1):0;
-  await send(`╔══════════════════════╗
-║  📊 تقرير AXOM اليومي  ║
-╚══════════════════════╝
-
-💰 PnL:   ${(stats?.net_pnl||0)>=0?'+':''}$${(+(stats?.net_pnl||0)).toFixed(4)}
-💸 رسوم: $${(+(stats?.total_fees||0)).toFixed(4)}
-📊 صفقات: ${stats?.total_trades||0}
-✅ WR:    ${wr}%
-
-/start_day لبدء يوم جديد 🚀`);
-}
-
-async function sendError(source, msg) {
-  await send(`🚨 <b>خطأ — ${source}</b>\n${msg}`);
-}
-
-async function sendProfitLock(bal, high) {
-  await send(`⚠️ <b>Profit Protection!</b>
-📈 أعلى: $${high.toFixed(4)}
-💰 الآن: $${bal.toFixed(4)}
-تراجع 50% من الذروة!`,
-    { reply_markup:{ inline_keyboard:[[
-      { text:'▶️ استمر', callback_data:'continue_trading' },
-      { text:'🔒 أوقف',  callback_data:'stop_trading'     }
-    ]]}});
-}
-
-async function sendDailyStop(loss, limit) {
-  await send(`🛑 <b>Daily Stop محقق</b>
-💸 خسارة: $${loss.toFixed(2)}  حد: $${limit.toFixed(2)}
-البوت توقف. /start_day غداً.`);
-}
-
-async function sendBalanceAlert(balance, mode) {
-  await send(`⚠️ <b>تنبيه رصيد</b>
-وضع: ${mode}
-رصيد: $${balance.toFixed(4)}
-لا يكفي لفتح صفقة جديدة.`);
+async function getChatHistory(n=8) {
+  const { data } = await sb.from('chat_history').select('*').order('timestamp',{ascending:false}).limit(n);
+  return (data||[]).reverse();
 }
 
 module.exports = {
-  init, setStateRef, update,
-  startLiveDashboard, stopLiveDashboard, resetDashMsg,
-  send, sendTradeOpen, sendTP, sendClose,
-  sendDailyReport, sendError, sendProfitLock,
-  sendDailyStop, sendBalanceAlert
+  getSettings, updateSettings,
+  createSession, getActiveSession, updateSession, getTodaySession,
+  saveTrade, updateTrade, getOpenTrades, getTodayTrades, getRecentTrades,
+  saveSignal, getRecentSignals,
+  saveSuggestion, getPendingSuggestions, updateSuggestion,
+  upsertStats, getDailyStats, getWeeklyStats,
+  saveLog, getRecentLogs,
+  saveError, getUnresolvedErrors, resolveError,
+  saveChat, getChatHistory
 };
