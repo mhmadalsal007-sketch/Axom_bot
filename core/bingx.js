@@ -1,120 +1,163 @@
 // ============================================================
-// AXOM — BingX API (replaces Binance)
-// Supports both REAL and PAPER trading modes
+// AXOM — BingX REST API
+// All trading operations, balance checks, market data
+// Demo (paper) mode fully integrated
 // ============================================================
-const axios = require('axios');
+const axios  = require('axios');
 const crypto = require('crypto');
-const WebSocket = require('ws');
+const logger = require('../utils/logger');
 
-const BASE = 'https://open-api.bingx.com';
-const WS_BASE = 'wss://open-api-ws.bingx.com/market';
-const TAKER_FEE = 0.0005; // 0.05% BingX taker
-const MAKER_FEE = 0.0002; // 0.02% BingX maker
+const BASE      = 'https://open-api.bingx.com';
+const TAKER_FEE = 0.0005; // 0.05%
 
-// ─── PAPER TRADING STATE ─────────────────────────────────────
-const paperState = {
-  balance: 1000,
-  positions: {},
-  orders: {},
-  orderIdCounter: 1000
-};
-
-function resetPaper(balance = 1000) {
-  paperState.balance = balance;
-  paperState.positions = {};
-  paperState.orders = {};
-  paperState.orderIdCounter = 1000;
+// ─── AUTH ─────────────────────────────────────────────────────
+function sign(qs) {
+  return crypto
+    .createHmac('sha256', process.env.BINGX_SECRET_KEY || '')
+    .update(qs).digest('hex');
+}
+function authHeaders() {
+  return { 'X-BX-APIKEY': process.env.BINGX_API_KEY || '', 'Content-Type': 'application/json' };
+}
+function buildParams(obj) {
+  const ts  = Date.now();
+  const base = { ...obj, timestamp: ts, recvWindow: 5000 };
+  const qs   = Object.entries(base).map(([k,v]) => `${k}=${v}`).join('&');
+  return { ...base, signature: sign(qs), _qs: qs };
 }
 
-function getPaperBalance() { return paperState.balance; }
+// ─── PAPER TRADING ENGINE ─────────────────────────────────────
+class PaperEngine {
+  constructor() {
+    this.balance   = 1000.00; // default paper balance
+    this.positions = {};
+    this.orders    = {};
+    this.orderId   = 10000;
+    this.history   = [];
+  }
 
-function updatePaperBalance(amount) {
-  paperState.balance += amount;
-  return paperState.balance;
+  setBalance(amount) { this.balance = parseFloat(amount); }
+
+  getBalance() {
+    return {
+      asset: 'USDT',
+      balance: this.balance,
+      availableMargin: this.balance,
+      unrealizedProfit: this._calcUnrealizedPnl()
+    };
+  }
+
+  _calcUnrealizedPnl() {
+    return Object.values(this.positions)
+      .reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
+  }
+
+  placeOrder({ symbol, side, quantity, price, leverage, stopLoss, takeProfit }) {
+    const id     = `PAPER_${++this.orderId}`;
+    const notional = quantity * price;
+    const margin   = notional / leverage;
+    const fee      = notional * TAKER_FEE;
+
+    if (this.balance < margin + fee) {
+      return { success: false, error: 'رصيد تجريبي غير كافٍ', balance: this.balance };
+    }
+
+    this.balance -= (margin + fee);
+
+    this.positions[symbol] = {
+      symbol, side, quantity,
+      entryPrice: price, leverage,
+      margin, fee,
+      stopLoss, takeProfit,
+      orderId: id,
+      openedAt: Date.now(),
+      unrealizedPnl: 0
+    };
+
+    logger.info('PAPER', `Order: ${side} ${symbol} qty:${quantity} @ ${price} x${leverage}`);
+    return { success: true, orderId: id, status: 'FILLED', executedPrice: price, fee };
+  }
+
+  updatePnl(symbol, currentPrice) {
+    const pos = this.positions[symbol];
+    if (!pos) return;
+    const diff = pos.side === 'BUY'
+      ? currentPrice - pos.entryPrice
+      : pos.entryPrice - currentPrice;
+    pos.unrealizedPnl = diff * pos.quantity;
+    pos.currentPrice  = currentPrice;
+  }
+
+  closePosition(symbol, closePrice, reason = 'MANUAL') {
+    const pos = this.positions[symbol];
+    if (!pos) return null;
+
+    const diff  = pos.side === 'BUY'
+      ? closePrice - pos.entryPrice
+      : pos.entryPrice - closePrice;
+    const pnl   = diff * pos.quantity;
+    const fee   = closePrice * pos.quantity * TAKER_FEE;
+    const netPnl = pnl - fee;
+
+    this.balance += pos.margin + netPnl;
+
+    const trade = { symbol, side: pos.side, pnl, fee, netPnl, reason, closedAt: Date.now(), duration: Date.now() - pos.openedAt };
+    this.history.push(trade);
+    delete this.positions[symbol];
+
+    logger.info('PAPER', `Closed ${symbol}: PnL ${netPnl >= 0 ? '+' : ''}$${netPnl.toFixed(4)}`);
+    return { ...trade, balance: this.balance };
+  }
+
+  getPositions() { return Object.values(this.positions); }
+  getHistory()   { return this.history.slice(-20); }
+  reset(balance = 1000) { this.balance = balance; this.positions = {}; this.orders = {}; this.history = []; }
 }
 
-// ─── SIGNATURE ───────────────────────────────────────────────
-function sign(params) {
-  const q = Object.entries(params)
-    .filter(([,v]) => v !== undefined)
-    .map(([k,v]) => `${k}=${v}`)
-    .join('&');
-  return crypto.createHmac('sha256', process.env.BINGX_SECRET_KEY || process.env.BINANCE_SECRET_KEY || '')
-    .update(q).digest('hex');
-}
+const paper = new PaperEngine();
 
-function headers() {
-  return { 'X-BX-APIKEY': process.env.BINGX_API_KEY || process.env.BINANCE_API_KEY || '' };
-}
-
-// ─── PUBLIC API ───────────────────────────────────────────────
+// ─── PUBLIC API (no auth) ─────────────────────────────────────
 async function getKlines(symbol, interval, limit = 100) {
-  // BingX interval format: 1m, 5m, 15m, 30m, 1h, 4h, 1d
   try {
     const { data } = await axios.get(`${BASE}/openApi/swap/v2/quote/klines`, {
-      params: { symbol, interval, limit },
-      timeout: 5000
+      params: { symbol, interval, limit }, timeout: 5000
     });
-    if (!data?.data) return getFallbackKlines(symbol, interval, limit);
-    return data.data.map(k => ({
-      openTime: k[0], open: +k[1], high: +k[2], low: +k[3],
-      close: +k[4], volume: +k[5], closeTime: k[6]
+    if (data?.data?.length) {
+      return data.data.map(k => ({
+        openTime: +k[0], open: +k[1], high: +k[2],
+        low: +k[3], close: +k[4], volume: +k[5]
+      }));
+    }
+  } catch (e) {}
+  // Fallback: Binance futures public
+  try {
+    const { data } = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
+      params: { symbol, interval, limit }, timeout: 5000
+    });
+    return data.map(k => ({
+      openTime: +k[0], open: +k[1], high: +k[2],
+      low: +k[3], close: +k[4], volume: +k[5]
     }));
   } catch (e) {
-    return getFallbackKlines(symbol, interval, limit);
+    logger.error('API', `getKlines ${symbol}: ${e.message}`);
+    return [];
   }
 }
 
-// Fallback to Binance public API if BingX fails
-async function getFallbackKlines(symbol, interval, limit) {
-  const { data } = await axios.get('https://fapi.binance.com/fapi/v1/klines', {
-    params: { symbol, interval, limit }, timeout: 5000
-  });
-  return data.map(k => ({
-    openTime: k[0], open: +k[1], high: +k[2], low: +k[3],
-    close: +k[4], volume: +k[5], closeTime: k[6]
-  }));
-}
-
-async function getPrice(symbol) {
-  try {
-    const { data } = await axios.get(`${BASE}/openApi/swap/v2/quote/price`, {
-      params: { symbol }, timeout: 3000
-    });
-    return parseFloat(data?.data?.price || 0);
-  } catch {
-    // Fallback Binance
-    const { data } = await axios.get('https://fapi.binance.com/fapi/v1/ticker/price', {
-      params: { symbol }, timeout: 3000
-    });
-    return parseFloat(data.price);
-  }
-}
-
-async function getTicker24h(symbol) {
+async function getTicker(symbol) {
   try {
     const { data } = await axios.get(`${BASE}/openApi/swap/v2/quote/ticker`, {
       params: { symbol }, timeout: 3000
     });
     const d = data?.data || {};
-    return {
-      price: parseFloat(d.lastPrice || 0),
-      change: parseFloat(d.priceChangePercent || 0),
-      volume: parseFloat(d.quoteVolume || 0),
-      high: parseFloat(d.highPrice || 0),
-      low: parseFloat(d.lowPrice || 0)
-    };
-  } catch {
-    const { data } = await axios.get('https://fapi.binance.com/fapi/v1/ticker/24hr', {
-      params: { symbol }, timeout: 3000
-    });
-    return {
-      price: parseFloat(data.lastPrice),
-      change: parseFloat(data.priceChangePercent),
-      volume: parseFloat(data.quoteVolume),
-      high: parseFloat(data.highPrice),
-      low: parseFloat(data.lowPrice)
-    };
+    return { price: +d.lastPrice || 0, change: +d.priceChangePercent || 0, volume: +d.quoteVolume || 0 };
+  } catch (e) {
+    try {
+      const { data } = await axios.get('https://fapi.binance.com/fapi/v1/ticker/24hr', {
+        params: { symbol }, timeout: 3000
+      });
+      return { price: +data.lastPrice, change: +data.priceChangePercent, volume: +data.quoteVolume };
+    } catch { return { price: 0, change: 0, volume: 0 }; }
   }
 }
 
@@ -122,20 +165,23 @@ async function getTopSymbols(limit = 50) {
   try {
     const { data } = await axios.get(`${BASE}/openApi/swap/v2/quote/ticker`, { timeout: 5000 });
     const tickers = Array.isArray(data?.data) ? data.data : [];
-    return tickers
-      .filter(s => s.symbol?.endsWith('-USDT') && parseFloat(s.quoteVolume) > 50000000)
-      .sort((a,b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
-      .slice(0, limit)
-      .map(s => s.symbol.replace('-', ''));
-  } catch {
-    // Fallback
+    if (tickers.length) {
+      return tickers
+        .filter(t => t.symbol?.endsWith('-USDT') && +t.quoteVolume > 20000000)
+        .sort((a,b) => +b.quoteVolume - +a.quoteVolume)
+        .slice(0, limit)
+        .map(t => t.symbol.replace('-USDT','USDT'));
+    }
+  } catch (e) {}
+  // Fallback Binance
+  try {
     const { data } = await axios.get('https://fapi.binance.com/fapi/v1/ticker/24hr', { timeout: 5000 });
     return data
-      .filter(s => s.symbol.endsWith('USDT') && parseFloat(s.quoteVolume) > 100000000)
-      .sort((a,b) => parseFloat(b.quoteVolume) - parseFloat(a.quoteVolume))
+      .filter(t => t.symbol.endsWith('USDT') && +t.quoteVolume > 50000000)
+      .sort((a,b) => +b.quoteVolume - +a.quoteVolume)
       .slice(0, limit)
-      .map(s => s.symbol);
-  }
+      .map(t => t.symbol);
+  } catch { return ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT','XRPUSDT']; }
 }
 
 async function getOI(symbol) {
@@ -146,7 +192,7 @@ async function getOI(symbol) {
     return parseFloat(data?.data?.openInterest || 0);
   } catch {
     try {
-      const sym = symbol.replace('USDT', '') + 'USDT';
+      const sym = symbol.replace('-','');
       const { data } = await axios.get('https://fapi.binance.com/fapi/v1/openInterest', {
         params: { symbol: sym }, timeout: 3000
       });
@@ -162,302 +208,174 @@ async function getFunding(symbol) {
     });
     return {
       fundingRate: parseFloat(data?.data?.lastFundingRate || 0),
-      markPrice: parseFloat(data?.data?.markPrice || 0)
+      markPrice:   parseFloat(data?.data?.markPrice || 0)
     };
   } catch {
     try {
+      const sym = symbol.replace('-','');
       const { data } = await axios.get('https://fapi.binance.com/fapi/v1/premiumIndex', {
-        params: { symbol }, timeout: 3000
+        params: { symbol: sym }, timeout: 3000
       });
-      return {
-        fundingRate: parseFloat(data.lastFundingRate || 0),
-        markPrice: parseFloat(data.markPrice || 0)
-      };
+      return { fundingRate: parseFloat(data.lastFundingRate||0), markPrice: parseFloat(data.markPrice||0) };
     } catch { return { fundingRate: 0, markPrice: 0 }; }
   }
 }
 
-async function getLSRatio(symbol) {
-  try {
-    const { data } = await axios.get('https://fapi.binance.com/futures/data/globalLongShortAccountRatio', {
-      params: { symbol, period: '1h', limit: 1 }, timeout: 3000
-    });
-    return parseFloat(data[0]?.longShortRatio || 1);
-  } catch { return 1; }
-}
+// ─── AUTHENTICATED API ────────────────────────────────────────
+async function getBalance() {
+  const mode = process.env.BOT_MODE || 'PAPER';
 
-async function getOrderBook(symbol, limit = 20) {
-  try {
-    const { data } = await axios.get(`${BASE}/openApi/swap/v2/quote/depth`, {
-      params: { symbol, limit }, timeout: 3000
-    });
-    return {
-      bids: (data?.data?.bids || []).map(b => ({ price: +b[0], qty: +b[1] })),
-      asks: (data?.data?.asks || []).map(a => ({ price: +a[0], qty: +a[1] }))
-    };
-  } catch { return { bids: [], asks: [] }; }
-}
+  if (mode === 'PAPER') {
+    const pb = paper.getBalance();
+    return { mode: 'PAPER', balance: pb.balance, available: pb.availableMargin, unrealizedPnl: pb.unrealizedProfit };
+  }
 
-// ─── FEE CALCULATOR ───────────────────────────────────────────
-function calcFees(positionSize, entryPrice, closePrice) {
-  const feeOpen  = positionSize * entryPrice * TAKER_FEE;
-  const feeClose = positionSize * closePrice * TAKER_FEE;
-  return { feeOpen, feeClose, totalFees: feeOpen + feeClose };
-}
-
-function calcPositionSize(riskAmount, entryPrice, stopLoss, leverage) {
-  const slDist = Math.abs(entryPrice - stopLoss);
-  const slPct  = slDist / entryPrice;
-  if (slPct <= 0) return null;
-  const positionValue = riskAmount / slPct;
-  const positionSize  = positionValue / entryPrice;
-  const margin        = positionValue / leverage;
-  return {
-    positionSize: parseFloat(positionSize.toFixed(6)),
-    positionValue: parseFloat(positionValue.toFixed(4)),
-    margin: parseFloat(margin.toFixed(4)),
-    slPct: parseFloat((slPct * 100).toFixed(4))
-  };
-}
-
-// ─── PAPER TRADING ENGINE ────────────────────────────────────
-function paperPlaceOrder({ symbol, side, type, quantity, price, stopPrice }) {
-  const orderId = `PAPER_${++paperState.orderIdCounter}`;
-  const execPrice = price || stopPrice || 0;
-
-  if (type === 'MARKET' || type === 'LIMIT') {
-    // Simulate fill
-    paperState.positions[symbol] = paperState.positions[symbol] || { size: 0, side: null, entryPrice: 0 };
-    const pos = paperState.positions[symbol];
-
-    if (!pos.side || pos.size === 0) {
-      pos.side = side;
-      pos.size = parseFloat(quantity);
-      pos.entryPrice = execPrice;
-    } else {
-      // Add to position
-      pos.size += parseFloat(quantity);
+  // DEMO mode — BingX demo account
+  if (mode === 'DEMO') {
+    try {
+      const p  = buildParams({});
+      const { data } = await axios.get(`${BASE}/openApi/swap/v2/user/balance`, {
+        params: { timestamp: p.timestamp, recvWindow: p.recvWindow, signature: p.signature },
+        headers: authHeaders(), timeout: 5000
+      });
+      const usdt = (data?.data?.balance?.assets || []).find(a => a.asset === 'USDT');
+      const bal  = parseFloat(usdt?.availableMargin || 0);
+      return { mode: 'DEMO', balance: bal, available: bal, raw: usdt };
+    } catch (e) {
+      logger.error('API', `getBalance DEMO failed: ${e.message}`);
+      throw new Error(`فشل جلب رصيد DEMO: ${e.message}`);
     }
   }
 
-  return { orderId, status: 'FILLED', price: execPrice, symbol, side, quantity };
-}
-
-function paperClosePosition(symbol, closePrice, size) {
-  const pos = paperState.positions[symbol];
-  if (!pos || pos.size === 0) return { pnl: 0 };
-
-  const closeSize = size || pos.size;
-  const isLong = pos.side === 'BUY';
-  const pnl = isLong
-    ? (closePrice - pos.entryPrice) * closeSize
-    : (pos.entryPrice - closePrice) * closeSize;
-
-  pos.size -= closeSize;
-  if (pos.size <= 0) {
-    pos.size = 0;
-    pos.side = null;
-    pos.entryPrice = 0;
-  }
-
-  updatePaperBalance(pnl);
-  return { pnl, closedSize: closeSize };
-}
-
-function getPaperPositions() {
-  return Object.entries(paperState.positions)
-    .filter(([,p]) => p.size > 0)
-    .map(([symbol, p]) => ({ symbol, ...p }));
-}
-
-// ─── REAL TRADING ENDPOINTS ───────────────────────────────────
-async function setLeverage(symbol, leverage) {
-  if (process.env.BOT_MODE !== 'REAL') return { leverage };
-  const params = { symbol, leverage, timestamp: Date.now(), recvWindow: 5000 };
-  params.signature = sign(params);
+  // REAL mode
   try {
-    const { data } = await axios.post(`${BASE}/openApi/swap/v2/trade/leverage`, null, {
-      params, headers: headers(), timeout: 5000
+    const p  = buildParams({});
+    const { data } = await axios.get(`${BASE}/openApi/swap/v2/user/balance`, {
+      params: { timestamp: p.timestamp, recvWindow: p.recvWindow, signature: p.signature },
+      headers: authHeaders(), timeout: 5000
     });
+    const usdt = (data?.data?.balance?.assets || []).find(a => a.asset === 'USDT');
+    const bal  = parseFloat(usdt?.availableMargin || 0);
+    if (bal === 0 && !usdt) throw new Error('لا يوجد رصيد USDT في الحساب');
+    return { mode: 'REAL', balance: bal, available: bal, raw: usdt };
+  } catch (e) {
+    logger.error('API', `getBalance REAL failed: ${e.message}`);
+    throw new Error(`فشل جلب الرصيد: ${e.message}`);
+  }
+}
+
+async function setLeverage(symbol, leverage) {
+  if (process.env.BOT_MODE === 'PAPER') return { leverage };
+  try {
+    const p  = buildParams({ symbol, side: 'Long', leverage: parseInt(leverage) });
+    const qs = `symbol=${p.symbol}&side=${p.side}&leverage=${p.leverage}&timestamp=${p.timestamp}&recvWindow=${p.recvWindow}`;
+    const sig = sign(qs);
+    const { data } = await axios.post(
+      `${BASE}/openApi/swap/v2/trade/leverage?${qs}&signature=${sig}`,
+      null, { headers: authHeaders(), timeout: 5000 }
+    );
     return data?.data || { leverage };
   } catch (e) {
-    console.error('setLeverage error:', e.message);
+    logger.error('API', `setLeverage ${symbol}: ${e.message}`);
     return { leverage };
   }
 }
 
-async function placeOrder({ symbol, side, type, quantity, price, stopPrice, reduceOnly }) {
-  if (process.env.BOT_MODE !== 'REAL') {
-    return paperPlaceOrder({ symbol, side, type, quantity, price, stopPrice });
+async function placeOrder({ symbol, side, type = 'MARKET', quantity, price, stopLoss, takeProfit, leverage = 10 }) {
+  const mode = process.env.BOT_MODE || 'PAPER';
+
+  if (mode === 'PAPER') {
+    const currentPrice = price || 0;
+    return paper.placeOrder({ symbol, side, quantity, price: currentPrice, leverage, stopLoss, takeProfit });
   }
 
-  const params = {
-    symbol, side, type,
-    quantity: parseFloat(quantity).toFixed(3),
-    timestamp: Date.now(),
-    recvWindow: 5000
+  try {
+    // Set leverage first
+    await setLeverage(symbol, leverage);
+
+    const orderData = {
+      symbol, side, type,
+      quantity: quantity.toFixed(3),
+      positionSide: side === 'BUY' ? 'LONG' : 'SHORT'
+    };
+    if (type === 'LIMIT' && price) { orderData.price = price.toFixed(2); orderData.timeInForce = 'GTC'; }
+
+    const qs  = Object.entries({ ...orderData, timestamp: Date.now(), recvWindow: 5000 }).map(([k,v])=>`${k}=${v}`).join('&');
+    const sig = sign(qs);
+
+    const { data } = await axios.post(
+      `${BASE}/openApi/swap/v2/trade/order?${qs}&signature=${sig}`,
+      null, { headers: authHeaders(), timeout: 5000 }
+    );
+
+    const orderId = data?.data?.orderId;
+    if (!orderId) throw new Error(data?.msg || 'No orderId returned');
+
+    // Place SL/TP
+    if (stopLoss)   await placeSLTP(symbol, side, quantity, stopLoss, 'STOP_MARKET');
+    if (takeProfit) await placeSLTP(symbol, side, quantity, takeProfit, 'TAKE_PROFIT_MARKET');
+
+    return { success: true, orderId, status: data?.data?.status, fee: 0 };
+  } catch (e) {
+    logger.error('API', `placeOrder ${symbol}: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
+async function placeSLTP(symbol, side, quantity, stopPrice, type) {
+  try {
+    const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
+    const qs = `symbol=${symbol}&side=${closeSide}&type=${type}&quantity=${quantity.toFixed(3)}&stopPrice=${stopPrice.toFixed(2)}&reduceOnly=true&timestamp=${Date.now()}&recvWindow=5000`;
+    const sig = sign(qs);
+    await axios.post(`${BASE}/openApi/swap/v2/trade/order?${qs}&signature=${sig}`, null, { headers: authHeaders(), timeout: 5000 });
+  } catch (e) {
+    logger.warn('API', `SL/TP placement for ${symbol}: ${e.message}`);
+  }
+}
+
+async function closePosition(symbol, side, quantity, currentPrice) {
+  const mode = process.env.BOT_MODE || 'PAPER';
+  if (mode === 'PAPER') return paper.closePosition(symbol, currentPrice, 'CLOSE');
+
+  try {
+    const closeSide = side === 'BUY' ? 'SELL' : 'BUY';
+    const qs  = `symbol=${symbol}&side=${closeSide}&type=MARKET&quantity=${quantity.toFixed(3)}&reduceOnly=true&timestamp=${Date.now()}&recvWindow=5000`;
+    const sig = sign(qs);
+    const { data } = await axios.post(`${BASE}/openApi/swap/v2/trade/order?${qs}&signature=${sig}`, null, { headers: authHeaders(), timeout: 5000 });
+    return { success: true, orderId: data?.data?.orderId };
+  } catch (e) {
+    logger.error('API', `closePosition ${symbol}: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
+// ─── HELPERS ─────────────────────────────────────────────────
+function calcFees(posSize, entryPrice, closePrice) {
+  return {
+    feeOpen:    posSize * entryPrice * TAKER_FEE,
+    feeClose:   posSize * closePrice * TAKER_FEE,
+    totalFees:  posSize * (entryPrice + closePrice) * TAKER_FEE
   };
-
-  if (type === 'LIMIT' && price) {
-    params.price = parseFloat(price).toFixed(2);
-    params.timeInForce = 'GTC';
-  }
-  if (stopPrice) params.stopPrice = parseFloat(stopPrice).toFixed(2);
-  if (reduceOnly) params.reduceOnly = 'true';
-
-  params.signature = sign(params);
-
-  const { data } = await axios.post(`${BASE}/openApi/swap/v2/trade/order`, null, {
-    params, headers: headers(), timeout: 5000
-  });
-  return data?.data || {};
 }
 
-async function cancelOrder(symbol, orderId) {
-  if (process.env.BOT_MODE !== 'REAL') return { status: 'CANCELED' };
-  const params = { symbol, orderId, timestamp: Date.now() };
-  params.signature = sign(params);
-  const { data } = await axios.delete(`${BASE}/openApi/swap/v2/trade/order`, {
-    params, headers: headers(), timeout: 5000
-  });
-  return data?.data || {};
-}
-
-async function getBalance() {
-  if (process.env.BOT_MODE !== 'REAL') {
-    return { balance: getPaperBalance() };
-  }
-  const params = { timestamp: Date.now() };
-  params.signature = sign(params);
-  const { data } = await axios.get(`${BASE}/openApi/swap/v2/user/balance`, {
-    params, headers: headers(), timeout: 5000
-  });
-  const usdt = (data?.data?.balance?.assets || []).find(a => a.asset === 'USDT');
-  return { balance: parseFloat(usdt?.availableMargin || 0) };
-}
-
-async function getPositions() {
-  if (process.env.BOT_MODE !== 'REAL') return getPaperPositions();
-  const params = { timestamp: Date.now() };
-  params.signature = sign(params);
-  const { data } = await axios.get(`${BASE}/openApi/swap/v2/user/positions`, {
-    params, headers: headers(), timeout: 5000
-  });
-  return (data?.data || []).filter(p => parseFloat(p.positionAmt || 0) !== 0);
-}
-
-// ─── BINGX WEBSOCKET ─────────────────────────────────────────
-class AxomWebSocket {
-  constructor() {
-    this.ws = null;
-    this.isAlive = false;
-    this.reconnectTimer = null;
-    this.pingTimer = null;
-    this.reconnectAttempts = 0;
-    this.priceCallbacks = [];
-    this.liquidationCallbacks = [];
-    this.symbols = [];
-  }
-
-  onPrice(cb) { this.priceCallbacks.push(cb); }
-  onLiquidation(cb) { this.liquidationCallbacks.push(cb); }
-
-  connect(symbols) {
-    this.symbols = symbols;
-    // BingX uses Binance-compatible stream format for public data
-    // Fall back to Binance public WS for price feeds
-    const streams = symbols.flatMap(s => [
-      `${s.toLowerCase()}@aggTrade`,
-      `${s.toLowerCase()}@forceOrder`
-    ]).join('/');
-
-    const url = `wss://fstream.binance.com/stream?streams=${streams}`;
-    this._connectWS(url);
-  }
-
-  _connectWS(url) {
-    this.ws = new WebSocket(url);
-
-    this.ws.on('open', () => {
-      this.isAlive = true;
-      this.reconnectAttempts = 0;
-      this._startPing();
-      console.log(`✅ WebSocket connected`);
-    });
-
-    this.ws.on('message', (raw) => {
-      try {
-        const { stream, data } = JSON.parse(raw);
-        if (!stream || !data) return;
-
-        if (stream.includes('aggTrade')) {
-          this.priceCallbacks.forEach(cb => cb({
-            symbol: data.s,
-            price: parseFloat(data.p),
-            qty: parseFloat(data.q),
-            time: data.T
-          }));
-        }
-
-        if (stream.includes('forceOrder')) {
-          this.liquidationCallbacks.forEach(cb => cb({
-            symbol: data.o?.s,
-            side: data.o?.S,
-            price: parseFloat(data.o?.p || 0),
-            qty: parseFloat(data.o?.q || 0),
-            value: parseFloat(data.o?.p || 0) * parseFloat(data.o?.q || 0)
-          }));
-        }
-      } catch (e) {}
-    });
-
-    this.ws.on('pong', () => { this.isAlive = true; });
-
-    this.ws.on('close', () => {
-      this.isAlive = false;
-      this._clearPing();
-      const delay = Math.min(3000 * (this.reconnectAttempts + 1), 30000);
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectAttempts++;
-        console.log(`🔄 Reconnecting WS (attempt ${this.reconnectAttempts})...`);
-        this._connectWS(url);
-      }, delay);
-    });
-
-    this.ws.on('error', (err) => {
-      console.error('WS Error:', err.message);
-    });
-  }
-
-  _startPing() {
-    this._clearPing();
-    this.pingTimer = setInterval(() => {
-      if (!this.isAlive) { this.ws?.terminate(); return; }
-      this.isAlive = false;
-      try { this.ws.ping(); } catch (e) {}
-    }, 20000);
-  }
-
-  _clearPing() {
-    if (this.pingTimer)    { clearInterval(this.pingTimer);    this.pingTimer = null; }
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
-  }
-
-  isConnected() { return this.isAlive; }
-  disconnect()  { this._clearPing(); this.ws?.terminate(); }
+function calcPositionSize(riskUSD, entryPrice, stopLoss, leverage) {
+  const slDist  = Math.abs(entryPrice - stopLoss);
+  const slPct   = slDist / entryPrice;
+  if (slPct <= 0) return null;
+  const posVal  = riskUSD / slPct;
+  const posSize = posVal / entryPrice;
+  const margin  = posVal / leverage;
+  return {
+    positionSize: parseFloat(posSize.toFixed(6)),
+    positionValue: parseFloat(posVal.toFixed(4)),
+    margin: parseFloat(margin.toFixed(4)),
+    slPct: parseFloat((slPct * 100).toFixed(3))
+  };
 }
 
 module.exports = {
-  // Public
-  getKlines, getPrice, getTicker24h, getTopSymbols,
-  getOI, getFunding, getLSRatio, getOrderBook,
-  // Calc
+  getKlines, getTicker, getTopSymbols, getOI, getFunding,
+  getBalance, setLeverage, placeOrder, closePosition,
   calcFees, calcPositionSize,
-  // Trading
-  setLeverage, placeOrder, cancelOrder, getBalance, getPositions,
-  // Paper
-  resetPaper, getPaperBalance, updatePaperBalance,
-  paperPlaceOrder, paperClosePosition, getPaperPositions,
-  // WS
-  AxomWebSocket, TAKER_FEE
+  paper, TAKER_FEE
 };
