@@ -205,13 +205,33 @@ class BingXWSEngine {
 
   // ── Private account WSS (BingX listen key) ──
   async connectAccount() {
-    const listenKey = await this.lkManager.create();
-    if (!listenKey) {
-      logger.warn('BINGX', 'No ListenKey — account updates unavailable (check API keys)');
+    const mode = process.env.BOT_MODE || 'PAPER';
+
+    // Paper mode: no account WSS needed
+    if (mode === 'PAPER') {
+      logger.info('WSS', 'Paper mode — account channel skipped');
       return;
     }
 
-    const url = `${BINGX_WSS}/swap?listenKey=${listenKey}`;
+    // Check API keys are set
+    const apiKey = process.env.BINGX_API_KEY || '';
+    if (!apiKey || apiKey === 'your_bingx_api_key_here' || apiKey.length < 10) {
+      logger.warn('WSS', 'BingX API keys not configured — account channel skipped');
+      return;
+    }
+
+    const listenKey = await this.lkManager.create();
+    if (!listenKey) {
+      logger.warn('BINGX', 'No ListenKey obtained — account WSS unavailable');
+      return;
+    }
+
+    // Use VST endpoint for DEMO, live for REAL
+    const baseWS = mode === 'DEMO'
+      ? 'wss://open-api-ws-vst.bingx.com/market'
+      : 'wss://open-api-ws.bingx.com/market';
+
+    const url = `${baseWS}/swap?listenKey=${listenKey}`;
     this.accountChannel = new WSSChannel('ACCOUNT', url, (data) => {
       if (data.e === 'ORDER_TRADE_UPDATE' || data.e === 'executionReport') {
         this.orderCallbacks.forEach(cb => cb(data));
