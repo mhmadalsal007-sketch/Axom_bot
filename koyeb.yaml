@@ -13,9 +13,8 @@ services:
       - path: /health
         port: 8000
     build:
-      buildpack:
-        build_command: "npm install --production=false"
-        run_command: "node index.js"
+      type: dockerfile
+      dockerfile: Dockerfile
     env:
       - key: NODE_ENV
         value: production
