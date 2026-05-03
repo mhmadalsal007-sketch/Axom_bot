@@ -16,6 +16,7 @@ const dash     = require('./core/dashboard');
 const logger   = require('./utils/logger');
 const scorer   = require('./brain/scorer');
 const { register } = require('./handlers/commands');
+const ramCache = require('./core/ramCache');
 const { openTrade, monitorAll, closeAll, CompoundState } = require('./trading/executor');
 
 // ─── APP STATE ────────────────────────────────────────────────
@@ -39,7 +40,7 @@ app.get('/', (_, res) => res.json({
   uptime: process.uptime(), ts: Date.now()
 }));
 app.get('/health', (_, res) => res.json({ status:'ok', ts:Date.now() }));
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => logger.info('SERVER', `Health check on :${PORT}`));
 
 // ─── START BOT ────────────────────────────────────────────────
@@ -159,6 +160,7 @@ async function mainLoop() {
     if (appState.scanMode === 'OFF') return;
 
     const topSymbols = await bingx.getTopSymbols(30);
+    ramCache.setTrackedSymbols(topSymbols.slice(0, 25)); // keep cache warm
     const { top3, best } = await scorer.rankCandidates(topSymbols.slice(0,20));
     appState.top3 = top3;
 
@@ -206,6 +208,30 @@ ${best.confidence==='HIGH'?'🔥':'⚠️'} ${best.confidence}
 
     // AUTO mode: execute best opportunity
     if (appState.scanMode === 'AUTO' && best) {
+      // HIGH score (>=80) → deep AI validation before entering
+      if (best.score >= 80) {
+        try {
+          const G       = require('./core/gemini');
+          const deepRes = await G.deepAnalysis(best);
+          if (deepRes) {
+            if (!deepRes.confirmed) {
+              logger.warn('AI', `Deep analysis rejected ${best.symbol}: ${deepRes.final_verdict}`);
+              await dash.send(`⚠️ <b>AI رفض الفرصة</b>
+<b>${best.symbol}</b> Score:${best.score}
+${deepRes.final_verdict}`);
+              return;
+            }
+            // Enrich signal with AI insights
+            best.summary     = deepRes.final_verdict || best.summary;
+            best.ai_confirmed = true;
+            best.risk_note    = deepRes.risk_note;
+            if (deepRes.adjusted_tp2) best.tp2 = deepRes.adjusted_tp2;
+            logger.info('AI', `Deep confirmed ${best.symbol} → ${deepRes.confidence}`);
+          }
+        } catch (e) {
+          logger.warn('AI', `Deep analysis error: ${e.message} — proceeding anyway`);
+        }
+      }
       const trade = await openTrade(best, appState.session, appState.compound);
       appState.openTrades.push(trade);
     }
@@ -385,6 +411,10 @@ async function main() {
     scorer.initGemini();
     logger.info('AI','Gemini initialized ✅');
 
+    // Init RAM Cache
+    ramCache.init();
+    logger.info('CACHE','RAM Cache Engine started ✅');
+
     // Init Telegram
     const bot = new TgBot(process.env.TELEGRAM_BOT_TOKEN, { polling:true });
     const cid = process.env.TELEGRAM_CHAT_ID;
@@ -420,12 +450,18 @@ async function main() {
     logger.info('AXOM','✅ Ready! Send /start in Telegram.');
     console.log('');
 
-    await dash.send(`🟢 <b>AXOM v3 Online!</b>
+    await dash.send(`╔══════════════════╗
+║ 🟢 AXOM v3 Online  ║
+╚══════════════════╝
 
-النظام جاهز.
-/start_day لبدء التداول.
+✅ جميع الأنظمة تعمل
+📡 WSS: ${wss.isMarketConnected()?'🟢 متصل':'🔴 يتصل...'}
+💾 RAM Cache: 🟢 نشط
+🤖 Gemini AI: 🟢 جاهز
 
-⏰ ${new Date().toLocaleString('ar-SA')}`);
+👉 اضغط <b>🚀 بدء يوم</b> للبدء
+
+⏰ ${new Date().toLocaleString('ar-SA')}`, require('./handlers/keyboards').mainMenu);
 
   } catch (e) {
     console.error('❌ Startup failed:', e.message);
