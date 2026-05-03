@@ -187,4 +187,3 @@ module.exports = {
   getStats,
   setCandles, // for WSS price updates
 };
-
