@@ -11,7 +11,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: PORT
-        value: 3000
+        value: 8000
       - key: BOT_MODE
         value: PAPER
       - key: TELEGRAM_BOT_TOKEN
