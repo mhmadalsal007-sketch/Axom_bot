@@ -256,7 +256,7 @@ async function closeTrade(t, closePrice, reason, sizePct=1.0) {
   if (process.env.BOT_MODE === 'REAL') {
     await bingx.closePosition(t.symbol, t.direction==='LONG'?'BUY':'SELL', size, closePrice);
   } else {
-    bingx.paper.closePosition(t.symbol, closePrice, reason);
+    bingx.paper.close(t.symbol, closePrice, reason);
   }
 
   const updated = await db.updateTrade(t.id, {
