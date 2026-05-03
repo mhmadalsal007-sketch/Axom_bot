@@ -9,6 +9,7 @@ const bingx  = require('../core/bingx');
 const MT     = require('../core/marketTracker');
 const logger = require('../utils/logger');
 const { sleep, DELAY_MS } = bingx;
+// RAM cache is required inline in scoreSymbol (lazy load)
 
 let model = null;
 
@@ -44,11 +45,9 @@ Return JSON only:
 async function scoreSymbol(symbol) {
   logger.info('SCORER', `🔍 Analyzing ${symbol}...`);
   try {
-    // Fetch all timeframes sequentially (not parallel)
-    const c1m  = await bingx.getKlines(symbol, '1m', 60);  await sleep(300);
-    const c5m  = await bingx.getKlines(symbol, '5m', 60);  await sleep(300);
-    const c15m = await bingx.getKlines(symbol, '15m', 30); await sleep(300);
-    const c1h  = await bingx.getKlines(symbol, '1h', 30);
+    // Read from RAM Cache (instant — no API calls if warm)
+    const cache = require('../core/ramCache');
+    const { c1m, c5m, c15m, c1h } = await cache.getFullData(symbol);
 
     if (!c1h.length || !c5m.length) {
       logger.warn('SCORER', `${symbol} — no candle data, skipping`);
