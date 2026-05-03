@@ -1,0 +1,35 @@
+services:
+  - name: axom-bot
+    type: web
+    git:
+      branch: main
+    instance_type: nano
+    regions:
+      - par
+    ports:
+      - port: 8000
+        protocol: http
+    health_checks:
+      - path: /health
+        port: 8000
+    env:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "8000"
+      - key: BOT_MODE
+        value: PAPER
+      - key: TELEGRAM_BOT_TOKEN
+        secret: true
+      - key: TELEGRAM_CHAT_ID
+        secret: true
+      - key: SUPABASE_URL
+        secret: true
+      - key: SUPABASE_SERVICE_KEY
+        secret: true
+      - key: BINGX_API_KEY
+        secret: true
+      - key: BINGX_SECRET_KEY
+        secret: true
+      - key: GEMINI_API_KEY
+        secret: true
