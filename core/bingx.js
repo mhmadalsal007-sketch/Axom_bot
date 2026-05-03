@@ -149,21 +149,42 @@ async function setLeverage(symbol, leverage) {
 
 async function placeOrder({ symbol, side, type='MARKET', quantity, price, leverage=10, stopLoss, takeProfit }) {
   const mode = process.env.BOT_MODE || 'PAPER';
-  if (mode === 'PAPER') return paper.open({ symbol, side, qty:quantity, price:price||0, leverage, sl:stopLoss, tp:takeProfit });
+
+  // PAPER: local simulation only
+  if (mode === 'PAPER') {
+    return paper.open({ symbol, side, qty:quantity, price:price||0, leverage, sl:stopLoss, tp:takeProfit });
+  }
+
+  // DEMO & REAL: send to BingX (VST for DEMO, live for REAL)
   return withRetry(async () => {
     await setLeverage(symbol, leverage);
-    const od = { symbol, side, type, quantity:parseFloat(quantity).toFixed(3),
-      positionSide:side==='BUY'?'LONG':'SHORT', timestamp:Date.now(), recvWindow:5000 };
-    if (type==='LIMIT'&&price) { od.price=price.toFixed(2); od.timeInForce='GTC'; }
-    const qs  = Object.entries(od).map(([k,v])=>`${k}=${v}`).join('&');
-    const { data } = await axios.post(`${TRADE_BASE()}/openApi/swap/v2/trade/order?${qs}&signature=${sign(qs)}`,
-      null, { headers:authHeaders(), timeout:TIMEOUT });
+    const od = {
+      symbol,
+      side,
+      type,
+      quantity:     parseFloat(quantity).toFixed(3),
+      positionSide: side === 'BUY' ? 'LONG' : 'SHORT',
+      timestamp:    Date.now(),
+      recvWindow:   5000,
+    };
+    if (type === 'LIMIT' && price) {
+      od.price       = price.toFixed(2);
+      od.timeInForce = 'GTC';
+    }
+    const qs  = Object.entries(od).map(([k,v]) => `${k}=${v}`).join('&');
+    const url = `${TRADE_BASE()}/openApi/swap/v2/trade/order?${qs}&signature=${sign(qs)}`;
+    logger.info('BINGX', `[${mode}] Placing ${side} ${symbol} x${leverage} qty:${od.quantity}`);
+    const { data } = await axios.post(url, null, { headers:authHeaders(), timeout:TIMEOUT });
     const orderId = data?.data?.orderId;
-    if (!orderId) throw new Error(data?.msg || 'No orderId');
+    if (!orderId) throw new Error(data?.msg || `No orderId — code:${data?.code}`);
     if (stopLoss)   await _sltp(symbol, side, quantity, stopLoss,   'STOP_MARKET');
     if (takeProfit) await _sltp(symbol, side, quantity, takeProfit, 'TAKE_PROFIT_MARKET');
-    return { success:true, orderId, status:data?.data?.status||'FILLED' };
-  }, `placeOrder ${symbol}`).catch(e => ({ success:false, error:e.message }));
+    logger.info('BINGX', `[${mode}] Order FILLED ✅ orderId:${orderId}`);
+    return { success:true, orderId, status:data?.data?.status || 'FILLED', mode };
+  }, `placeOrder ${symbol}`).catch(e => {
+    logger.error('BINGX', `placeOrder ${symbol} FAILED: ${e.message}`);
+    return { success:false, error:e.message, mode };
+  });
 }
 
 async function _sltp(symbol, side, qty, stopPrice, type) {
