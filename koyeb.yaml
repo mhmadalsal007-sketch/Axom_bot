@@ -12,6 +12,10 @@ services:
     health_checks:
       - path: /health
         port: 8000
+    build:
+      buildpack:
+        build_command: "npm install --production=false"
+        run_command: "node index.js"
     env:
       - key: NODE_ENV
         value: production
